@@ -182,6 +182,13 @@ class Trainer(object):
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
         self.model = model
 
+        #TODO：time plane frozen
+        for plane_idx in [2, 4, 5]:  # time-grids off
+            for i in range(len(model.field.grids)):
+                model.field.grids[i][plane_idx].requires_grad = False
+            for i in range(len(model.proposal_networks)):
+                model.proposal_networks[i].grids[plane_idx].requires_grad = False
+
         # guide model
         self.guidance = guidance
         self.embeddings = {}
@@ -465,10 +472,17 @@ class Trainer(object):
                 bg_color = None # use bg_net
             else:
                 bg_color = torch.rand(3).to(self.device) # single color random bg
-
-        outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=False, perturb=True, bg_color=bg_color, ambient_ratio=ambient_ratio, shading=shading, binarize=binarize)
+        #TODO:modify the render procedure
+        rays_o = torch.squeeze(rays_o)
+        rays_d = torch.squeeze(rays_d)
+        timestamps = torch.ones_like(rays_o).to(rays_d.device)
+        near_far = torch.tensor([0.4,2.6]).to(rays_d.device)
+        near_far = near_far.repeat(N,1)
+        outputs = self.model(rays_o,rays_d,timestamps,near_far)
+        #outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=False, perturb=True, bg_color=bg_color, ambient_ratio=ambient_ratio, shading=shading, binarize=binarize)
+        #TODO:modify the result procedure
         pred_depth = outputs['depth'].reshape(B, 1, H, W)
-        pred_mask = outputs['weights_sum'].reshape(B, 1, H, W)
+        #pred_mask = outputs['weights_sum'].reshape(B, 1, H, W)
         if 'normal_image' in outputs:
             pred_normal = outputs['normal_image'].reshape(B, H, W, 3)
 

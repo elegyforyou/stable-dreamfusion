@@ -2,11 +2,28 @@ import torch
 import argparse
 import pandas as pd
 import sys
+import importlib.util
+from typing import List, Dict, Any
 
 from nerf.provider import NeRFDataset
 from nerf.utils import *
-
+from plenoxels.models.lowrank_model import LowrankModel
 # torch.autograd.set_detect_anomaly(True)
+def initialize_kplanes(config,opt):
+
+    grid_config=config.get("grid_config")
+    config.pop("grid_config")
+    model = LowrankModel(
+        opt,
+        grid_config=grid_config,
+        aabb=torch.tensor(config.get("scene_bbox")),
+        is_ndc=config.get("ndc"),
+        is_contracted=config.get("contract"),
+        global_scale=torch.tensor([1, 1, 1]),
+        global_translation=torch.tensor([0, 0, 0]),
+        use_appearance_embedding=False,
+        **config)
+    return model
 
 if __name__ == '__main__':
     # See https://stackoverflow.com/questions/27433316/how-to-get-argparse-to-read-arguments-from-a-file-with-an-option-rather-than-pre
@@ -162,7 +179,11 @@ if __name__ == '__main__':
     parser.add_argument('--exp_end_iter', type=int, default=None, help="end iter # for experiment, to calculate progressive_view and progressive_level")
 
     opt = parser.parse_args()
-
+    kplane_config_path = './plenoxels/configs/final/DyNeRF/dynerf_hybrid.py'
+    spec = importlib.util.spec_from_file_location(os.path.basename(kplane_config_path), kplane_config_path)
+    cfg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cfg)
+    config: Dict[str, Any] = cfg.config
     if opt.O:
         opt.fp16 = True
         opt.cuda_ray = True
@@ -305,8 +326,9 @@ if __name__ == '__main__':
         seed_everything(int(opt.seed))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    model = NeRFNetwork(opt).to(device)
+    #TODO:modify the initialization
+    #model = NeRFNetwork(opt).to(device)
+    model = initialize_kplanes(config,opt)
 
     if opt.dmtet and opt.init_with != '':
         if opt.init_with.endswith('.pth'):
