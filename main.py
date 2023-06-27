@@ -5,6 +5,8 @@ import sys
 import importlib.util
 from typing import List, Dict, Any
 
+from torchsummary import torchsummary
+
 from nerf.provider import NeRFDataset
 from nerf.utils import *
 from plenoxels.models.lowrank_model import LowrankModel
@@ -165,8 +167,8 @@ if __name__ == '__main__':
 
     ### GUI options
     parser.add_argument('--gui', action='store_true', help="start a GUI")
-    parser.add_argument('--W', type=int, default=800, help="GUI width")
-    parser.add_argument('--H', type=int, default=800, help="GUI height")
+    parser.add_argument('--W', type=int, default=128, help="GUI width")
+    parser.add_argument('--H', type=int, default=128, help="GUI height")
     parser.add_argument('--radius', type=float, default=5, help="default GUI camera radius from center")
     parser.add_argument('--fovy', type=float, default=20, help="default GUI camera fovy")
     parser.add_argument('--light_theta', type=float, default=60, help="default GUI light direction in [0, 180], corresponding to elevation [90, -90]")
@@ -366,7 +368,7 @@ if __name__ == '__main__':
     elif opt.test:
         guidance = None # no need to load guidance model at test
 
-        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, fp16=opt.fp16, use_checkpoint=opt.ckpt)
+        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, fp16=opt.fp16, use_checkpoint=opt.ckpt,**config)
 
         if opt.gui:
             from nerf.gui import NeRFGUI
@@ -414,8 +416,8 @@ if __name__ == '__main__':
         if 'clip' in opt.guidance:
             from guidance.clip_utils import CLIP
             guidance['clip'] = CLIP(device)
-
-        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint=opt.ckpt, scheduler_update_every_step=True)
+        config.pop('device')
+        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint=opt.ckpt, scheduler_update_every_step=True,**config)
 
         trainer.default_view_data = train_loader._data.get_default_view_data()
 

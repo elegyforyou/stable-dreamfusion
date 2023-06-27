@@ -1,6 +1,8 @@
 import os
 import gc
 import glob
+from typing import Sequence
+
 import tqdm
 import math
 import imageio
@@ -10,7 +12,7 @@ import random
 import shutil
 import warnings
 import tensorboardX
-
+import raymarching
 import numpy as np
 
 import time
@@ -30,6 +32,9 @@ from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
+from plenoxels.runners.regularization import Regularizer, PlaneTV, TimeSmoothness, L1TimePlanes, HistogramLoss, \
+    DistortionLoss
+
 
 def adjust_text_embeddings(embeddings, azimuth, opt):
     text_z_list = []
@@ -221,8 +226,9 @@ class Trainer(object):
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                 **config#k-planes conf
                  ):
-
+        self.aabb_train = torch.FloatTensor([-opt.bound, -opt.bound, -opt.bound, opt.bound, opt.bound, opt.bound]).to(device)
         self.argv = argv
         self.name = name
         self.opt = opt
@@ -243,7 +249,8 @@ class Trainer(object):
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
-
+        #TODO：add regularizar
+        self.regularizers = self.init_regularizers(**config)
         model.to(self.device)
         if self.world_size > 1:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -355,6 +362,22 @@ class Trainer(object):
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
 
+    def init_regularizers(self, **kwargs):
+        # Keep only the regularizers with a positive weight
+        regularizers = [r for r in self.get_regularizers(**kwargs) if r.weight > 0]
+        return regularizers
+
+    def get_regularizers(self, **kwargs):
+        return [
+            PlaneTV(kwargs.get('plane_tv_weight', 0.0), what='field'),
+            PlaneTV(kwargs.get('plane_tv_weight_proposal_net', 0.0), what='proposal_network'),
+            L1TimePlanes(kwargs.get('l1_time_planes', 0.0), what='field'),
+            L1TimePlanes(kwargs.get('l1_time_planes_proposal_net', 0.0), what='proposal_network'),
+            TimeSmoothness(kwargs.get('time_smoothness_weight', 0.0), what='field'),
+            TimeSmoothness(kwargs.get('time_smoothness_weight_proposal_net', 0.0), what='proposal_network'),
+            HistogramLoss(kwargs.get('histogram_loss_weight', 0.0)),
+            DistortionLoss(kwargs.get('distortion_loss_weight', 0.0)),
+        ]
     # calculate the text embs.
     @torch.no_grad()
     def prepare_embeddings(self):
@@ -543,10 +566,18 @@ class Trainer(object):
         #TODO:modify the render procedure
         rays_o = torch.squeeze(rays_o)
         rays_d = torch.squeeze(rays_d)
-        timestamps = torch.ones_like(rays_o).to(rays_d.device)
-        near_far = torch.tensor([0.4,2.6]).to(rays_d.device)
-        near_far = near_far.repeat(N,1)
-        outputs = self.model(rays_o,rays_d,timestamps,near_far)
+        timestamps = torch.ones(rays_o.shape[0]).to(rays_d.device)
+        rays_o = rays_o.contiguous().view(-1, 3)
+        rays_d = rays_d.contiguous().view(-1, 3)
+        # pre-calculate near far
+        nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d,self.aabb_train )
+        near_fars = torch.cat([nears.unsqueeze(1),fars.unsqueeze(1)],dim=1)
+        # near_far = torch.tensor([0.4,2.6]).to(rays_d.device)
+        # near_far = near_far.repeat(N,1)
+        rays_o = rays_o.contiguous().view(-1,N, 3).squeeze()
+        rays_d = rays_d.contiguous().view(-1,N, 3).squeeze()
+
+        outputs = self.model(rays_o.squeeze(),rays_d.squeeze(),bg_color=None,timestamps=timestamps,near_far=near_fars)
         #outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=False, perturb=True, bg_color=bg_color, ambient_ratio=ambient_ratio, shading=shading, binarize=binarize)
         #TODO:modify the result procedure
         pred_depth = outputs['depth'].reshape(B, 1, H, W)
@@ -556,9 +587,9 @@ class Trainer(object):
 
         if as_latent:
             # abuse normal & mask as latent code for faster geometry initialization (ref: fantasia3D)
-            pred_rgb = torch.cat([outputs['image'], outputs['weights_sum'].unsqueeze(-1)], dim=-1).reshape(B, H, W, 4).permute(0, 3, 1, 2).contiguous() # [B, 4, H, W]
+            pred_rgb = torch.cat([outputs['rgb'], outputs['accumulation']], dim=-1).reshape(B, H, W, 4).permute(0, 3, 1, 2).contiguous() # [B, 4, H, W]
         else:
-            pred_rgb = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous() # [B, 3, H, W]
+            pred_rgb = outputs['rgb'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous() # [B, 3, H, W]
 
         # known view loss
         if do_rgbd_loss:
@@ -694,45 +725,48 @@ class Trainer(object):
                 lambda_guidance = 10 * (1 - abs(azimuth) / 180) * self.opt.lambda_guidance
 
                 loss = loss + self.guidance['clip'].train_step(self.embeddings['clip'], pred_rgb, grad_scale=lambda_guidance)
-
+        #TODO：regularization in k-planes
+        for r in self.regularizers:
+            reg_loss = r.regularize(self.model, model_out=outputs)
+            loss = loss + reg_loss
         # regularizations
-        if not self.opt.dmtet:
-
-            if self.opt.lambda_opacity > 0:
-                loss_opacity = (outputs['weights_sum'] ** 2).mean()
-                loss = loss + self.opt.lambda_opacity * loss_opacity
-
-            if self.opt.lambda_entropy > 0:
-                alphas = outputs['weights'].clamp(1e-5, 1 - 1e-5)
-                # alphas = alphas ** 2 # skewed entropy, favors 0 over 1
-                loss_entropy = (- alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).mean()
-                lambda_entropy = self.opt.lambda_entropy * min(1, 2 * self.global_step / self.opt.iters)
-                loss = loss + lambda_entropy * loss_entropy
-
-            if self.opt.lambda_2d_normal_smooth > 0 and 'normal_image' in outputs:
-                # pred_vals = outputs['normal_image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
-                # smoothed_vals = TF.gaussian_blur(pred_vals.detach(), kernel_size=9)
-                # loss_smooth = F.mse_loss(pred_vals, smoothed_vals)
-                # total-variation
-                loss_smooth = (pred_normal[:, 1:, :, :] - pred_normal[:, :-1, :, :]).square().mean() + \
-                              (pred_normal[:, :, 1:, :] - pred_normal[:, :, :-1, :]).square().mean()
-                loss = loss + self.opt.lambda_2d_normal_smooth * loss_smooth
-
-            if self.opt.lambda_orient > 0 and 'loss_orient' in outputs:
-                loss_orient = outputs['loss_orient']
-                loss = loss + self.opt.lambda_orient * loss_orient
-
-            if self.opt.lambda_3d_normal_smooth > 0 and 'loss_normal_perturb' in outputs:
-                loss_normal_perturb = outputs['loss_normal_perturb']
-                loss = loss + self.opt.lambda_3d_normal_smooth * loss_normal_perturb
-
-        else:
-
-            if self.opt.lambda_mesh_normal > 0:
-                loss = loss + self.opt.lambda_mesh_normal * outputs['normal_loss']
-
-            if self.opt.lambda_mesh_laplacian > 0:
-                loss = loss + self.opt.lambda_mesh_laplacian * outputs['lap_loss']
+        # if not self.opt.dmtet:
+        #
+        #     if self.opt.lambda_opacity > 0:
+        #         loss_opacity = (outputs['weights_sum'] ** 2).mean()
+        #         loss = loss + self.opt.lambda_opacity * loss_opacity
+        #
+        #     if self.opt.lambda_entropy > 0:
+        #         alphas = outputs['weights'].clamp(1e-5, 1 - 1e-5)
+        #         # alphas = alphas ** 2 # skewed entropy, favors 0 over 1
+        #         loss_entropy = (- alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).mean()
+        #         lambda_entropy = self.opt.lambda_entropy * min(1, 2 * self.global_step / self.opt.iters)
+        #         loss = loss + lambda_entropy * loss_entropy
+        #
+        #     if self.opt.lambda_2d_normal_smooth > 0 and 'normal_image' in outputs:
+        #         # pred_vals = outputs['normal_image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
+        #         # smoothed_vals = TF.gaussian_blur(pred_vals.detach(), kernel_size=9)
+        #         # loss_smooth = F.mse_loss(pred_vals, smoothed_vals)
+        #         # total-variation
+        #         loss_smooth = (pred_normal[:, 1:, :, :] - pred_normal[:, :-1, :, :]).square().mean() + \
+        #                       (pred_normal[:, :, 1:, :] - pred_normal[:, :, :-1, :]).square().mean()
+        #         loss = loss + self.opt.lambda_2d_normal_smooth * loss_smooth
+        #
+        #     if self.opt.lambda_orient > 0 and 'loss_orient' in outputs:
+        #         loss_orient = outputs['loss_orient']
+        #         loss = loss + self.opt.lambda_orient * loss_orient
+        #
+        #     if self.opt.lambda_3d_normal_smooth > 0 and 'loss_normal_perturb' in outputs:
+        #         loss_normal_perturb = outputs['loss_normal_perturb']
+        #         loss = loss + self.opt.lambda_3d_normal_smooth * loss_normal_perturb
+        #
+        # else:
+        #
+        #     if self.opt.lambda_mesh_normal > 0:
+        #         loss = loss + self.opt.lambda_mesh_normal * outputs['normal_loss']
+        #
+        #     if self.opt.lambda_mesh_laplacian > 0:
+        #         loss = loss + self.opt.lambda_mesh_laplacian * outputs['lap_loss']
 
         return pred_rgb, pred_depth, loss
 
@@ -763,12 +797,27 @@ class Trainer(object):
         B, N = rays_o.shape[:2]
         H, W = data['H'], data['W']
 
-        shading = data['shading'] if 'shading' in data else 'albedo'
-        ambient_ratio = data['ambient_ratio'] if 'ambient_ratio' in data else 1.0
-        light_d = data['light_d'] if 'light_d' in data else None
+        # shading = data['shading'] if 'shading' in data else 'albedo'
+        # ambient_ratio = data['ambient_ratio'] if 'ambient_ratio' in data else 1.0
+        # light_d = data['light_d'] if 'light_d' in data else None
 
-        outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=True, perturb=False, bg_color=None, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading)
-        pred_rgb = outputs['image'].reshape(B, H, W, 3)
+        # TODO:modify the render procedure
+        rays_o = torch.squeeze(rays_o)
+        rays_d = torch.squeeze(rays_d)
+        timestamps = torch.ones(rays_o.shape[0]).to(rays_d.device)
+        rays_o = rays_o.contiguous().view(-1, 3)
+        rays_d = rays_d.contiguous().view(-1, 3)
+        # pre-calculate near far
+        nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, self.aabb_train)
+        near_fars = torch.cat([nears.unsqueeze(1), fars.unsqueeze(1)], dim=1)
+        # near_far = torch.tensor([0.4,2.6]).to(rays_d.device)
+        # near_far = near_far.repeat(N,1)
+        rays_o = rays_o.contiguous().view(-1, N, 3).squeeze()
+        rays_d = rays_d.contiguous().view(-1, N, 3).squeeze()
+
+        outputs = self.model(rays_o.squeeze(),rays_d.squeeze(),bg_color=None,timestamps=timestamps,near_far=near_fars)
+        #outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=True, perturb=False, bg_color=None, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading)
+        pred_rgb = outputs['rgb'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
 
         # dummy
@@ -787,13 +836,28 @@ class Trainer(object):
         if bg_color is not None:
             bg_color = bg_color.to(rays_o.device)
 
-        shading = data['shading'] if 'shading' in data else 'albedo'
-        ambient_ratio = data['ambient_ratio'] if 'ambient_ratio' in data else 1.0
-        light_d = data['light_d'] if 'light_d' in data else None
+        # shading = data['shading'] if 'shading' in data else 'albedo'
+        # ambient_ratio = data['ambient_ratio'] if 'ambient_ratio' in data else 1.0
+        # light_d = data['light_d'] if 'light_d' in data else None
+        #
+        # outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=True, perturb=perturb, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading, bg_color=bg_color)
+        # TODO:modify the render procedure
+        rays_o = torch.squeeze(rays_o)
+        rays_d = torch.squeeze(rays_d)
+        timestamps = torch.ones(rays_o.shape[0]).to(rays_d.device)
+        rays_o = rays_o.contiguous().view(-1, 3)
+        rays_d = rays_d.contiguous().view(-1, 3)
+        # pre-calculate near far
+        nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, self.aabb_train)
+        near_fars = torch.cat([nears.unsqueeze(1), fars.unsqueeze(1)], dim=1)
+        # near_far = torch.tensor([0.4,2.6]).to(rays_d.device)
+        # near_far = near_far.repeat(N,1)
+        rays_o = rays_o.contiguous().view(-1, N, 3).squeeze()
+        rays_d = rays_d.contiguous().view(-1, N, 3).squeeze()
 
-        outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=True, perturb=perturb, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading, bg_color=bg_color)
+        outputs = self.model(rays_o.squeeze(),rays_d.squeeze(),bg_color=None,timestamps=timestamps,near_far=near_fars)
 
-        pred_rgb = outputs['image'].reshape(B, H, W, 3)
+        pred_rgb = outputs['rgb'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
 
         return pred_rgb, pred_depth, None
@@ -834,6 +898,7 @@ class Trainer(object):
 
             if self.epoch % self.opt.test_interval == 0 or self.epoch == max_epochs:
                 self.test(test_loader)
+            torch.cuda.empty_cache()
 
         end_t = time.time()
 
