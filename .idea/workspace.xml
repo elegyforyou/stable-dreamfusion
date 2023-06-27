@@ -6,8 +6,27 @@
   <component name="ChangeListManager">
     <list default="true" id="9ff768ba-e677-4557-bf84-0a5b616f2a33" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/nerf/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/nerf/utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam00.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam01.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam02.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam03.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam05.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam06.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam07.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam08.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam09.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam10.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam11.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam12.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam13.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam14.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam15.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam16.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam17.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam18.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam19.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/cam20.mp4" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plenoxels/data/dynerf/cut_roasted_beef/poses_bounds.npy" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -133,7 +152,7 @@
       <workItem from="1687436218193" duration="6229000" />
       <workItem from="1687608779897" duration="865000" />
       <workItem from="1687863903682" duration="1295000" />
-      <workItem from="1687870482279" duration="823000" />
+      <workItem from="1687870482279" duration="1892000" />
     </task>
     <servers />
   </component>
