@@ -6,6 +6,7 @@ from pathlib import Path
 
 # suppress partial model loading warning
 logging.set_verbosity_error()
+from PIL import Image
 
 import torch
 import torch.nn as nn
@@ -20,6 +21,9 @@ class SpecifyGradient(torch.autograd.Function):
     @custom_fwd
     def forward(ctx, input_tensor, gt_grad):
         ctx.save_for_backward(gt_grad)
+
+        # print("forward-gt_grad\n",gt_grad)
+
         # we return a dummy value 1, which will be scaled by amp's scaler so we get the scale in backward.
         return torch.ones([1], device=input_tensor.device, dtype=input_tensor.dtype)
 
@@ -28,6 +32,8 @@ class SpecifyGradient(torch.autograd.Function):
     def backward(ctx, grad_scale):
         gt_grad, = ctx.saved_tensors
         gt_grad = gt_grad * grad_scale
+        # print("backward-grad_scale:\n",grad_scale)
+        # print("backward-gt_grad:\n",gt_grad)
         return gt_grad, None
 
 def seed_everything(seed):
@@ -81,6 +87,7 @@ class StableDiffusion(nn.Module):
         del pipe
 
         self.num_train_timesteps = self.scheduler.config.num_train_timesteps
+        self.scheduler.set_timesteps(50)
         self.min_step = int(self.num_train_timesteps * t_range[0])
         self.max_step = int(self.num_train_timesteps * t_range[1])
         self.alphas = self.scheduler.alphas_cumprod.to(self.device) # for convenience
@@ -177,7 +184,7 @@ class StableDiffusion(nn.Module):
         return loss
     
 
-    def train_step_perpneg(self, text_embeddings, weights, pred_rgb, guidance_scale=100, as_latent=False, grad_scale=1,
+    def train_step_perpneg(self, ratio,text_embeddings, weights, pred_rgb, guidance_scale=100, as_latent=False, grad_scale=1,
                    save_guidance_path:Path=None):
 
         B = pred_rgb.shape[0]
@@ -191,13 +198,45 @@ class StableDiffusion(nn.Module):
             # encode image into latents with vae, requires grad!
             latents = self.encode_imgs(pred_rgb_512)
 
+        current_max = int(min((self.max_step-self.min_step)*ratio+self.min_step+1,self.max_step))
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
-        t = torch.randint(self.min_step, self.max_step + 1, (latents.shape[0],), dtype=torch.long, device=self.device)
+        t = torch.randint(self.min_step, self.max_step, (latents.shape[0],), dtype=torch.long, device=self.device)
 
         # predict the noise residual with unet, NO grad!
         with torch.no_grad():
             # add noise
             noise = torch.randn_like(latents)
+
+            # from tqdm.auto import tqdm
+            # latents =noise
+            # latents = torch.cat([latents] * (1 + K))
+            # for t in tqdm(self.scheduler.timesteps):
+            #     # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+            #
+            #     latent_model_input = self.scheduler.scale_model_input(latents, timestep=t)
+            #     # t = torch.cat([t] * (1 + K))
+            #     # predict the noise residual
+            #     with torch.no_grad():
+            #         noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+            #
+            #
+            #     # perform guidance (high scale from paper!)
+            #     noise_pred_uncond, noise_pred_text = noise_pred[:B], noise_pred[B:]
+            #     delta_noise_preds = noise_pred_text - noise_pred_uncond.repeat(K, 1, 1, 1)
+            #     noise_pred = noise_pred_uncond + guidance_scale * weighted_perpendicular_aggregator(delta_noise_preds,
+            #                                                                                         weights, B)
+            #
+            #     # compute the previous noisy sample x_t -> x_t-1
+            #     latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+            # latents = 1 / 0.18215 * latents
+            # with torch.no_grad():
+            #     image = self.vae.decode(latents).sample
+            # image = (image / 2 + 0.5).clamp(0, 1)
+            # image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+            # images = (image * 255).round().astype("uint8")
+            # pil_images = [Image.fromarray(image) for image in images]
+            # pil_images[0].save("1.png")
+
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * (1 + K))
@@ -207,27 +246,14 @@ class StableDiffusion(nn.Module):
             # perform guidance (high scale from paper!)
             noise_pred_uncond, noise_pred_text = unet_output[:B], unet_output[B:]
             delta_noise_preds = noise_pred_text - noise_pred_uncond.repeat(K, 1, 1, 1)
-            noise_pred = noise_pred_uncond + guidance_scale * weighted_perpendicular_aggregator(delta_noise_preds, weights, B)            
-
-        # import kiui
-        # latents_tmp = torch.randn((1, 4, 64, 64), device=self.device)
-        # latents_tmp = latents_tmp.detach()
-        # kiui.lo(latents_tmp)
-        # self.scheduler.set_timesteps(30)
-        # for i, t in enumerate(self.scheduler.timesteps):
-        #     latent_model_input = torch.cat([latents_tmp] * 3)
-        #     noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
-        #     noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
-        #     noise_pred = noise_pred_uncond + 10 * (noise_pred_pos - noise_pred_uncond)
-        #     latents_tmp = self.scheduler.step(noise_pred, t, latents_tmp)['prev_sample']
-        # imgs = self.decode_latents(latents_tmp)
-        # kiui.vis.plot_image(imgs)
+            noise_pred = noise_pred_uncond + guidance_scale * weighted_perpendicular_aggregator(delta_noise_preds, weights, B)
 
         # w(t), sigma_t^2
         w = (1 - self.alphas[t])
         grad = grad_scale * w[:, None, None, None] * (noise_pred - noise)
         grad = torch.nan_to_num(grad)
-
+        #[1,4,64,64]
+        self.writer.add_image("grad", grad, global_step=self.global_step, dataformats='NCHW')
         if save_guidance_path:
             with torch.no_grad():
                 if as_latent:
@@ -248,7 +274,6 @@ class StableDiffusion(nn.Module):
 
                 # visualize noisier image
                 result_noisier_image = self.decode_latents(latents_noisy.to(pred_x0).type(self.precision_t))
-
 
 
                 # all 3 input images are [1, 3, H, W], e.g. [1, 3, 512, 512]
@@ -290,7 +315,6 @@ class StableDiffusion(nn.Module):
 
         imgs = self.vae.decode(latents).sample
         imgs = (imgs / 2 + 0.5).clamp(0, 1)
-
         return imgs
 
     def encode_imgs(self, imgs):

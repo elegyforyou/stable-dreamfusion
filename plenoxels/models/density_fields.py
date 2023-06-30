@@ -74,7 +74,9 @@ class KPlaneDensityField(nn.Module):
         return self.get_density(pts)
 
     def get_params(self):
-        field_params = {k: v for k, v in self.grids.named_parameters(prefix="grids")}
+        #field_params = {k: v for k, v in self.grids.named_parameters(prefix="grids")}
+        field_params = {k: v for k, v in filter(lambda p: p[1].requires_grad,self.grids.named_parameters(prefix="grids"))}
+
         nn_params = {k: v for k, v in self.sigma_net.named_parameters(prefix="sigma_net")}
         other_params = {k: v for k, v in self.named_parameters() if (
             k not in nn_params.keys() and k not in field_params.keys()

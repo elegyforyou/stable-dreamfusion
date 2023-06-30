@@ -14,6 +14,8 @@ from plenoxels.raymarching.ray_samplers import (
 from plenoxels.raymarching.spatial_distortions import SceneContraction, SpatialDistortion
 from plenoxels.utils.timer import CudaTimer
 
+import torch.nn.functional as F
+from torchvision.utils import save_image
 
 class LowrankModel(nn.Module):
     def __init__(self,

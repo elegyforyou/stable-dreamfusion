@@ -3,6 +3,7 @@ import gc
 import glob
 from typing import Sequence
 
+import torchvision
 import tqdm
 import math
 import imageio
@@ -190,6 +191,24 @@ def seed_everything(seed):
     #torch.backends.cudnn.deterministic = True
     #torch.backends.cudnn.benchmark = True
 
+def get_cosine_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    eta_min: float = 0.0,
+    num_cycles: float = 0.999,
+    last_epoch: int = -1,
+):
+    """
+    https://github.com/huggingface/transformers/blob/bd469c40659ce76c81f69c7726759d249b4aef49/src/transformers/optimization.py#L129
+    """
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(eta_min, 0.5 * (1.0 + math.cos(math.pi * ((float(num_cycles) * progress) % 1.0))))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 @torch.jit.script
 def linear_to_srgb(x):
@@ -260,9 +279,9 @@ class Trainer(object):
         #TODO：time plane frozen
         for plane_idx in [2, 4, 5]:  # time-grids off
             for i in range(len(model.field.grids)):
-                model.field.grids[i][plane_idx].requires_grad = False
+                self.model.field.grids[i][plane_idx].requires_grad = False
             for i in range(len(model.proposal_networks)):
-                model.proposal_networks[i].grids[plane_idx].requires_grad = False
+                self.model.proposal_networks[i].grids[plane_idx].requires_grad = False
 
         # guide model
         self.guidance = guidance
@@ -284,10 +303,13 @@ class Trainer(object):
             self.pearson = PearsonCorrCoef().to(self.device)
 
         if optimizer is None:
-            self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
+            self.optimizer = optim.Adam(self.model.get_params(config['lr']), lr=0.01, weight_decay=5e-4,eps=1e-15) # naive adam
         else:
             self.optimizer = optimizer(self.model)
 
+        #TODO:modify the lr_scheduler
+        # self.lr_scheduler = get_cosine_schedule_with_warmup(
+        #     self.optimizer, num_warmup_steps=512, num_training_steps=opt.iters/100)
         if lr_scheduler is None:
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
         else:
@@ -517,56 +539,57 @@ class Trainer(object):
             rays_d = rays_d[choice]
             mvp = mvp[choice]
 
-        if do_rgbd_loss:
-            ambient_ratio = 1.0
-            shading = 'lambertian' # use lambertian instead of albedo to get normal
-            as_latent = False
-            binarize = False
-            bg_color = torch.rand((B * N, 3), device=rays_o.device)
-
-            # add camera noise to avoid grid-like artifact
-            if self.opt.known_view_noise_scale > 0:
-                noise_scale = self.opt.known_view_noise_scale #* (1 - self.global_step / self.opt.iters)
-                rays_o = rays_o + torch.randn(3, device=self.device) * noise_scale
-                rays_d = rays_d + torch.randn(3, device=self.device) * noise_scale
-
-        elif exp_iter_ratio <= self.opt.latent_iter_ratio:
-            ambient_ratio = 1.0
-            shading = 'normal'
-            as_latent = True
-            binarize = False
-            bg_color = None
-
-        else:
-            if exp_iter_ratio <= self.opt.albedo_iter_ratio:
-                ambient_ratio = 1.0
-                shading = 'albedo'
-            else:
-                # random shading
-                ambient_ratio = self.opt.min_ambient_ratio + (1.0-self.opt.min_ambient_ratio) * random.random()
-                rand = random.random()
-                if rand >= (1.0 - self.opt.textureless_ratio):
-                    shading = 'textureless'
-                else:
-                    shading = 'lambertian'
-
-            as_latent = False
-
-            # random weights binarization (like mobile-nerf) [NOT WORKING NOW]
-            # binarize_thresh = min(0.5, -0.5 + self.global_step / self.opt.iters)
-            # binarize = random.random() < binarize_thresh
-            binarize = False
-
-            # random background
-            rand = random.random()
-            if self.opt.bg_radius > 0 and rand > 0.5:
-                bg_color = None # use bg_net
-            else:
-                bg_color = torch.rand(3).to(self.device) # single color random bg
+        # if do_rgbd_loss:
+        #     ambient_ratio = 1.0
+        #     shading = 'lambertian' # use lambertian instead of albedo to get normal
+        #     as_latent = False
+        #     binarize = False
+        #     bg_color = torch.rand((B * N, 3), device=rays_o.device)
+        #
+        #     # add camera noise to avoid grid-like artifact
+        #     if self.opt.known_view_noise_scale > 0:
+        #         noise_scale = self.opt.known_view_noise_scale #* (1 - self.global_step / self.opt.iters)
+        #         rays_o = rays_o + torch.randn(3, device=self.device) * noise_scale
+        #         rays_d = rays_d + torch.randn(3, device=self.device) * noise_scale
+        #
+        # elif exp_iter_ratio <= self.opt.latent_iter_ratio:
+        #     ambient_ratio = 1.0
+        #     shading = 'normal'
+        #     as_latent = True
+        #     binarize = False
+        #     bg_color = None
+        #
+        # else:
+        #     if exp_iter_ratio <= self.opt.albedo_iter_ratio:
+        #         ambient_ratio = 1.0
+        #         shading = 'albedo'
+        #     else:
+        #         # random shading
+        #         ambient_ratio = self.opt.min_ambient_ratio + (1.0-self.opt.min_ambient_ratio) * random.random()
+        #         rand = random.random()
+        #         if rand >= (1.0 - self.opt.textureless_ratio):
+        #             shading = 'textureless'
+        #         else:
+        #             shading = 'lambertian'
+        #
+        #     as_latent = False
+        #
+        #     # random weights binarization (like mobile-nerf) [NOT WORKING NOW]
+        #     # binarize_thresh = min(0.5, -0.5 + self.global_step / self.opt.iters)
+        #     # binarize = random.random() < binarize_thresh
+        #     binarize = False
+        #
+        #     # random background
+        #     rand = random.random()
+        #     if self.opt.bg_radius > 0 and rand > 0.5:
+        #         bg_color = None # use bg_net
+        #     else:
+        #         bg_color = torch.rand(3).to(self.device) # single color random bg
         #TODO:modify the render procedure
+        as_latent = False
         rays_o = torch.squeeze(rays_o)
         rays_d = torch.squeeze(rays_d)
-        timestamps = torch.ones(rays_o.shape[0]).to(rays_d.device)
+        timestamps = torch.zeros(rays_o.shape[0]).to(rays_d.device)
         rays_o = rays_o.contiguous().view(-1, 3)
         rays_d = rays_d.contiguous().view(-1, 3)
         # pre-calculate near far
@@ -576,8 +599,8 @@ class Trainer(object):
         # near_far = near_far.repeat(N,1)
         rays_o = rays_o.contiguous().view(-1,N, 3).squeeze()
         rays_d = rays_d.contiguous().view(-1,N, 3).squeeze()
-
-        outputs = self.model(rays_o.squeeze(),rays_d.squeeze(),bg_color=None,timestamps=timestamps,near_far=near_fars)
+        bg_color = torch.ones((1, 3), dtype=torch.float32, device=rays_d.device)
+        outputs = self.model(rays_o,rays_d,bg_color=bg_color,timestamps=timestamps,near_far=near_fars)
         #outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=False, perturb=True, bg_color=bg_color, ambient_ratio=ambient_ratio, shading=shading, binarize=binarize)
         #TODO:modify the result procedure
         pred_depth = outputs['depth'].reshape(B, 1, H, W)
@@ -669,8 +692,9 @@ class Trainer(object):
                         text_z.append(r * start_z + (1 - r) * end_z)
 
                 text_z = torch.cat(text_z, dim=0)
+                ratio = self.epoch/self.max_epochs
                 if self.opt.perpneg:
-                    loss = loss + self.guidance['SD'].train_step_perpneg(text_z, weights, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
+                    loss = loss + self.guidance['SD'].train_step_perpneg(ratio,text_z, weights, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
                                                     save_guidance_path=save_guidance_path)
                 else:
                     loss = loss + self.guidance['SD'].train_step(text_z, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
@@ -726,9 +750,9 @@ class Trainer(object):
 
                 loss = loss + self.guidance['clip'].train_step(self.embeddings['clip'], pred_rgb, grad_scale=lambda_guidance)
         #TODO：regularization in k-planes
-        for r in self.regularizers:
-            reg_loss = r.regularize(self.model, model_out=outputs)
-            loss = loss + reg_loss
+        # for r in self.regularizers:
+        #     reg_loss = r.regularize(self.model, model_out=outputs)
+        #     loss = loss + reg_loss
         # regularizations
         # if not self.opt.dmtet:
         #
@@ -804,7 +828,7 @@ class Trainer(object):
         # TODO:modify the render procedure
         rays_o = torch.squeeze(rays_o)
         rays_d = torch.squeeze(rays_d)
-        timestamps = torch.ones(rays_o.shape[0]).to(rays_d.device)
+        timestamps = torch.zeros(rays_o.shape[0]).to(rays_d.device)
         rays_o = rays_o.contiguous().view(-1, 3)
         rays_d = rays_d.contiguous().view(-1, 3)
         # pre-calculate near far
@@ -844,7 +868,7 @@ class Trainer(object):
         # TODO:modify the render procedure
         rays_o = torch.squeeze(rays_o)
         rays_d = torch.squeeze(rays_d)
-        timestamps = torch.ones(rays_o.shape[0]).to(rays_d.device)
+        timestamps = torch.zeros(rays_o.shape[0]).to(rays_d.device)
         rays_o = rays_o.contiguous().view(-1, 3)
         rays_d = rays_d.contiguous().view(-1, 3)
         # pre-calculate near far
@@ -854,6 +878,7 @@ class Trainer(object):
         # near_far = near_far.repeat(N,1)
         rays_o = rays_o.contiguous().view(-1, N, 3).squeeze()
         rays_d = rays_d.contiguous().view(-1, N, 3).squeeze()
+        bg_color = torch.ones((1, 3), dtype=torch.float32, device=rays_d.device)
 
         outputs = self.model(rays_o.squeeze(),rays_d.squeeze(),bg_color=None,timestamps=timestamps,near_far=near_fars)
 
@@ -879,9 +904,11 @@ class Trainer(object):
 
     def train(self, train_loader, valid_loader, test_loader, max_epochs):
 
+        self.max_epochs = max_epochs
         if self.use_tensorboardX and self.local_rank == 0:
-            self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
 
+            self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
+            self.guidance['SD'].writer = self.writer
         start_t = time.time()
 
         for epoch in range(self.epoch + 1, max_epochs + 1):
@@ -998,7 +1025,7 @@ class Trainer(object):
             self.scaler.scale(loss).backward()
             self.post_train_step()
             self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.scaler.update(1.0)
 
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
@@ -1117,7 +1144,7 @@ class Trainer(object):
 
             self.local_step += 1
             self.global_step += 1
-
+            self.guidance['SD'].global_step = self.global_step
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
@@ -1159,6 +1186,21 @@ class Trainer(object):
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
+                    self.writer.add_image("preds_rgb",pred_rgbs,global_step=self.global_step,dataformats='NCHW')
+                    # grid0 = self.model.field.grids[0][0].cpu().detach().numpy()
+                    # grid0 = torch.from_numpy(grid0)
+                    # grids = [None]*6
+                    # for i in [1,3]:
+                    #     grids[i] = self.model.field.grids[0][i].cpu().detach().numpy()
+                    #     grids[i] = torch.from_numpy(grids[i])
+                    # grid0 = torch.cat([grid0,grids[1],grids[3]],dim=0)
+                    # fmap_1_grid = torchvision.utils.make_grid(grid0, normalize=True, scale_each=True)
+                    # self.writer.add_image("grids[0][0]",fmap_1_grid,global_step=self.global_step)
+                    # self.writer.add_image("grids[0][1]",self.model.field.grids[0][1],global_step=self.global_step,dataformats='NCHW')
+                    # self.writer.add_image("grids[0][2]",self.model.field.grids[0][2],global_step=self.global_step,dataformats='NCHW')
+                    # self.writer.add_image("grids[0][3]",self.model.field.grids[0][3],global_step=self.global_step,dataformats='NCHW')
+                    # self.writer.add_image("grids[0][4]",self.model.field.grids[0][4],global_step=self.global_step,dataformats='NCHW')
+                    # self.writer.add_image("grids[0][5]",self.model.field.grids[0][2],global_step=self.global_step,dataformats='NCHW')
 
                 if self.scheduler_update_every_step:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")

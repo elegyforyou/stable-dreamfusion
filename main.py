@@ -11,6 +11,7 @@ from nerf.provider import NeRFDataset
 from nerf.utils import *
 from plenoxels.models.lowrank_model import LowrankModel
 # torch.autograd.set_detect_anomaly(True)
+
 def initialize_kplanes(config,opt):
 
     grid_config=config.get("grid_config")
@@ -18,11 +19,11 @@ def initialize_kplanes(config,opt):
     model = LowrankModel(
         opt,
         grid_config=grid_config,
-        aabb=torch.tensor(config.get("scene_bbox")),
+        aabb=torch.tensor(config.get("scene_bbox"),dtype=torch.float32),
         is_ndc=config.get("ndc"),
         is_contracted=config.get("contract"),
-        global_scale=torch.tensor([1, 1, 1]),
-        global_translation=torch.tensor([0, 0, 0]),
+        global_scale=torch.tensor([1, 1, 1],dtype=torch.float32),
+        global_translation=torch.tensor([0, 0, 0],dtype=torch.float32),
         use_appearance_embedding=False,
         **config)
     return model
@@ -74,7 +75,7 @@ if __name__ == '__main__':
     parser.add_argument('--side_decay_factor', type=float, default=10, help="decay factor for the side prompt")
 
     ### training options
-    parser.add_argument('--iters', type=int, default=10000, help="training iters")
+    parser.add_argument('--iters', type=int, default=100000, help="training iters")
     parser.add_argument('--lr', type=float, default=1e-3, help="max learning rate")
     parser.add_argument('--ckpt', type=str, default='latest', help="possible options are ['latest', 'scratch', 'best', 'latest_model']")
     parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
@@ -110,8 +111,8 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action='store_true', help="use float16 for training")
     parser.add_argument('--vram_O', action='store_true', help="optimization for low VRAM usage")
     # rendering resolution in training, increase these for better quality / decrease these if CUDA OOM even if --vram_O enabled.
-    parser.add_argument('--w', type=int, default=64, help="render width for NeRF in training")
-    parser.add_argument('--h', type=int, default=64, help="render height for NeRF in training")
+    parser.add_argument('--w', type=int, default=128, help="render width for NeRF in training")
+    parser.add_argument('--h', type=int, default=128, help="render height for NeRF in training")
     parser.add_argument('--known_view_scale', type=float, default=1.5, help="multiply --h/w by this for known view rendering")
     parser.add_argument('--known_view_noise_scale', type=float, default=2e-3, help="random camera noise added to rays_o and rays_d")
     parser.add_argument('--dmtet_reso_scale', type=float, default=8, help="multiply --h/w by this for dmtet finetuning")
@@ -122,12 +123,12 @@ if __name__ == '__main__':
     parser.add_argument('--dt_gamma', type=float, default=0, help="dt_gamma (>=0) for adaptive ray marching. set to 0 to disable, >0 to accelerate rendering (but usually with worse quality)")
     parser.add_argument('--min_near', type=float, default=0.01, help="minimum near distance for camera")
 
-    parser.add_argument('--radius_range', type=float, nargs='*', default=[3.0, 3.5], help="training camera radius range")
+    parser.add_argument('--radius_range', type=float, nargs='*', default=[1.0, 1.5], help="training camera radius range")
     parser.add_argument('--theta_range', type=float, nargs='*', default=[45, 105], help="training camera range along the polar angles (i.e. up and down). See advanced.md for details.")
     parser.add_argument('--phi_range', type=float, nargs='*', default=[-180, 180], help="training camera range along the azimuth angles (i.e. left and right). See advanced.md for details.")
     parser.add_argument('--fovy_range', type=float, nargs='*', default=[10, 30], help="training camera fovy range")
 
-    parser.add_argument('--default_radius', type=float, default=3.2, help="radius for the default view")
+    parser.add_argument('--default_radius', type=float, default=1.2, help="radius for the default view")
     parser.add_argument('--default_polar', type=float, default=90, help="polar for the default view")
     parser.add_argument('--default_azimuth', type=float, default=0, help="azimuth for the default view")
     parser.add_argument('--default_fovy', type=float, default=20, help="fovy for the default view")
@@ -159,7 +160,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_normal', type=float, default=0, help="loss scale for normal map")
     parser.add_argument('--lambda_depth', type=float, default=10, help="loss scale for relative depth")
     parser.add_argument('--lambda_2d_normal_smooth', type=float, default=0, help="loss scale for 2D normal image smoothness")
-    parser.add_argument('--lambda_3d_normal_smooth', type=float, default=0, help="loss scale for 3D normal image smoothness")
+    parser.add_argument('--lambda_3d_normal_smooth', type=float, default=0, help="loss scle for 3D normal image smoothness")
 
     ### debugging options
     parser.add_argument('--save_guidance', action='store_true', help="save images of the per-iteration NeRF renders, added noise, denoised (i.e. guidance), fully-denoised. Useful for debugging, but VERY SLOW and takes lots of memory!")
@@ -167,8 +168,8 @@ if __name__ == '__main__':
 
     ### GUI options
     parser.add_argument('--gui', action='store_true', help="start a GUI")
-    parser.add_argument('--W', type=int, default=128, help="GUI width")
-    parser.add_argument('--H', type=int, default=128, help="GUI height")
+    parser.add_argument('--W', type=int, default=256, help="GUI width")
+    parser.add_argument('--H', type=int, default=256, help="GUI height")
     parser.add_argument('--radius', type=float, default=5, help="default GUI camera radius from center")
     parser.add_argument('--fovy', type=float, default=20, help="default GUI camera fovy")
     parser.add_argument('--light_theta', type=float, default=60, help="default GUI light direction in [0, 180], corresponding to elevation [90, -90]")
@@ -368,6 +369,7 @@ if __name__ == '__main__':
     elif opt.test:
         guidance = None # no need to load guidance model at test
 
+        config.pop('device')
         trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, fp16=opt.fp16, use_checkpoint=opt.ckpt,**config)
 
         if opt.gui:
@@ -393,10 +395,12 @@ if __name__ == '__main__':
         else: # adam
             optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
 
+        #TODO：modify the original scheduler initialization
+
         if opt.backbone == 'vanilla':
             scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
         else:
-            scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 1) # fixed
+            scheduler = lambda optimizer: torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=100,eta_min=0.001)
             # scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
 
         guidance = nn.ModuleDict()
@@ -417,10 +421,10 @@ if __name__ == '__main__':
             from guidance.clip_utils import CLIP
             guidance['clip'] = CLIP(device)
         config.pop('device')
-        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint=opt.ckpt, scheduler_update_every_step=True,**config)
+        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer,scheduler=scheduler, ema_decay=0.95, fp16=opt.fp16, use_checkpoint=opt.ckpt, scheduler_update_every_step=True,**config)
 
         trainer.default_view_data = train_loader._data.get_default_view_data()
-
+        #--ckpt scratch
         if opt.gui:
             from nerf.gui import NeRFGUI
             gui = NeRFGUI(opt, trainer, train_loader)

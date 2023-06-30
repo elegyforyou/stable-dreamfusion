@@ -6,15 +6,15 @@ config = {
  # Run first for 1 step with data_downsample=4 to generate weights for ray importance sampling
  'data_downsample': 2,
  'data_dirs': ['data/dynerf/cut_roasted_beef'],
- 'contract': False,
- 'ndc': True,
+ 'contract': True,
+ 'ndc': False,
  'ndc_far': 2.6,
  'near_scaling': 0.95,
  'isg': False,
  'isg_step': -1,
  'ist_step': 50000,
  'keyframes': False,
- 'scene_bbox': [[-3.0, -1.8, -1.2], [3.0, 1.8, 1.2]],
+ 'scene_bbox': [[-1, -1, -1], [1, 1, 1]],
 
  # Optimization settings
  'num_steps': 90001,
@@ -41,7 +41,7 @@ config = {
 
  # Raymarching settings
  'single_jitter': False,
- 'num_samples': 48,
+ 'num_samples': 128,
  'num_proposal_samples': [256, 128],
  'num_proposal_iterations': 2,
  'use_same_proposal_network': False,

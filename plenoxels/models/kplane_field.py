@@ -199,9 +199,9 @@ class KPlaneField(nn.Module):
                     "n_hidden_layers": 1,
                 },
             )
+            #TODO:modify the model architexture
             self.in_dim_color = (
-                    self.direction_encoder.n_output_dims
-                    + self.geo_feat_dim
+                      self.geo_feat_dim
                     + self.appearance_embedding_dim
             )
             self.color_net = tcnn.Network(
@@ -264,11 +264,11 @@ class KPlaneField(nn.Module):
         if not self.linear_decoder:
             directions = get_normalized_directions(directions)
             encoded_directions = self.direction_encoder(directions)
-
+        #TODO:modify
         if self.linear_decoder:
             color_features = [features]
         else:
-            color_features = [encoded_directions, features.view(-1, self.geo_feat_dim)]
+            color_features = [features.view(-1, self.geo_feat_dim)]
 
         if self.use_appearance_embedding:
             if camera_indices.dtype == torch.float32:
@@ -318,7 +318,9 @@ class KPlaneField(nn.Module):
         return {"rgb": rgb, "density": density}
 
     def get_params(self):
-        field_params = {k: v for k, v in self.grids.named_parameters(prefix="grids")}
+        #field_params = {k: v for k, v in self.grids.named_parameters(prefix="grids")}
+        field_params = {k: v for k, v in filter(lambda p: p[1].requires_grad,self.grids.named_parameters(prefix="grids"))}
+
         nn_params = [
             self.sigma_net.named_parameters(prefix="sigma_net"),
             self.direction_encoder.named_parameters(prefix="direction_encoder"),
