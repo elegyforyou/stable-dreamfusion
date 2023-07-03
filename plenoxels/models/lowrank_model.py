@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from encoding import get_encoder
 from plenoxels.models.density_fields import KPlaneDensityField
 from plenoxels.models.kplane_field import KPlaneField
 from plenoxels.ops.activations import init_density_activation
@@ -16,6 +17,49 @@ from plenoxels.utils.timer import CudaTimer
 
 import torch.nn.functional as F
 from torchvision.utils import save_image
+
+class BasicBlock(nn.Module):
+    def __init__(self, dim_in, dim_out, bias=True):
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+
+        self.dense = nn.Linear(self.dim_in, self.dim_out, bias=bias)
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        # x: [B, C]
+
+        out = self.dense(x)
+        out = self.activation(out)
+
+        return out
+class MLP(nn.Module):
+    def __init__(self, dim_in, dim_out, dim_hidden, num_layers, bias=True, block=BasicBlock):
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.dim_hidden = dim_hidden
+        self.num_layers = num_layers
+
+        net = []
+        for l in range(num_layers):
+            if l == 0:
+                net.append(BasicBlock(self.dim_in, self.dim_hidden, bias=bias))
+            elif l != num_layers - 1:
+                net.append(block(self.dim_hidden, self.dim_hidden, bias=bias))
+            else:
+                net.append(nn.Linear(self.dim_hidden, self.dim_out, bias=bias))
+
+        self.net = nn.ModuleList(net)
+
+    def forward(self, x):
+
+        for l in range(self.num_layers):
+            x = self.net[l](x)
+
+        return x
+
 
 class LowrankModel(nn.Module):
     def __init__(self,
@@ -87,6 +131,14 @@ class LowrankModel(nn.Module):
             linear_decoder_layers=self.linear_decoder_layers,
             num_images=num_images,
         )
+        #TODO bg_net
+        num_layers_bg = 3  # 3 in paper
+        hidden_dim_bg = 32  # 64 in paper
+        encoding = 'frequency_torch' # pure pytorch
+        self.num_layers_bg = num_layers_bg
+        self.hidden_dim_bg = hidden_dim_bg
+        self.encoder_bg, self.in_dim_bg = get_encoder(encoding, input_dim=3, multires=4)
+        self.bg_net = MLP(self.in_dim_bg, 3, hidden_dim_bg, num_layers_bg, bias=True)
 
         # Initialize proposal-sampling nets
         self.density_fns = []
@@ -134,6 +186,16 @@ class LowrankModel(nn.Module):
             initial_sampler=initial_sampler
         )
 
+    def background(self, d):
+
+        h = self.encoder_bg(d)  # [N, C]
+
+        h = self.bg_net(h)
+
+        # sigmoid activation for rgb
+        rgbs = torch.sigmoid(h)
+
+        return rgbs
     def step_before_iter(self, step):
         if self.use_proposal_weight_anneal:
             # anneal the weights of the proposal network before doing PDF sampling
@@ -170,7 +232,7 @@ class LowrankModel(nn.Module):
         accumulation = torch.sum(weights, dim=-2)
         return accumulation
 
-    def forward(self, rays_o, rays_d, bg_color, near_far: torch.Tensor, timestamps=None):
+    def forward(self, rays_o, rays_d, bg_color,near_far: torch.Tensor, timestamps=None):
         """
         rays_o : [batch, 3]
         rays_d : [batch, 3]
@@ -198,6 +260,9 @@ class LowrankModel(nn.Module):
         weights_list.append(weights)
         ray_samples_list.append(ray_samples)
 
+        #TODO:add bg_color
+        bg_color = self.background(rays_d)  # [N, 3]
+
         rgb = self.render_rgb(rgb=rgb, weights=weights, bg_color=bg_color)
         depth = self.render_depth(weights=weights, ray_samples=ray_samples, rays_d=ray_bundle.directions)
         accumulation = self.render_accumulation(weights=weights)
@@ -222,8 +287,15 @@ class LowrankModel(nn.Module):
         field_params = model_params["field"] + [p for pnp in pn_params for p in pnp["field"]]
         nn_params = model_params["nn"] + [p for pnp in pn_params for p in pnp["nn"]]
         other_params = model_params["other"] + [p for pnp in pn_params for p in pnp["other"]]
+        bg_net_params = [p for p in self.bg_net.parameters()]
+
+        # field_params = list(set(field_params))
+        # nn_params = list(set(nn_params))
+        # other_params = list(set(other_params))
+
         return [
             {"params": field_params, "lr": lr},
             {"params": nn_params, "lr": lr},
             {"params": other_params, "lr": lr},
+            {"params":bg_net_params,"lr":lr}
         ]

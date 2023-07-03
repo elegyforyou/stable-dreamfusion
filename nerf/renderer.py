@@ -13,7 +13,7 @@ import nvdiffrast.torch as dr
 import mcubes
 import raymarching
 from meshutils import decimate_mesh, clean_mesh, poisson_mesh_reconstruction
-from .utils import custom_meshgrid, safe_normalize
+from nerf.utils import custom_meshgrid, safe_normalize
 
 
 def sample_pdf(bins, weights, n_samples, det=False):

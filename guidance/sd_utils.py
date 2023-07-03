@@ -66,7 +66,7 @@ class StableDiffusion(nn.Module):
         self.precision_t = torch.float16 if fp16 else torch.float32
 
         # Create model
-        pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=self.precision_t)
+        pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=self.precision_t,local_files_only=True,cache_dir='/home/yanhao/.cache/huggingface/hub')
 
         if vram_O:
             pipe.enable_sequential_cpu_offload()
@@ -82,7 +82,7 @@ class StableDiffusion(nn.Module):
         self.text_encoder = pipe.text_encoder
         self.unet = pipe.unet
 
-        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=self.precision_t)
+        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=self.precision_t,local_files_only=True,cache_dir='/home/yanhao/.cache/huggingface/hub')
 
         del pipe
 
@@ -104,7 +104,7 @@ class StableDiffusion(nn.Module):
         return embeddings
 
 
-    def train_step(self, text_embeddings, pred_rgb, guidance_scale=100, as_latent=False, grad_scale=1,
+    def train_step(self, ratio,text_embeddings, pred_rgb, guidance_scale=100, as_latent=False, grad_scale=1,
                    save_guidance_path:Path=None):
 
         if as_latent:
@@ -198,9 +198,12 @@ class StableDiffusion(nn.Module):
             # encode image into latents with vae, requires grad!
             latents = self.encode_imgs(pred_rgb_512)
 
-        current_max = int(min((self.max_step-self.min_step)*ratio+self.min_step+1,self.max_step))
+        current_max = min(int((self.max_step-self.min_step)*ratio)+self.min_step+1,self.max_step)
+        if ratio>0.5:
+            t = torch.randint(self.min_step, current_max, (latents.shape[0],), dtype=torch.long, device=self.device)
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
-        t = torch.randint(self.min_step, self.max_step, (latents.shape[0],), dtype=torch.long, device=self.device)
+        else:
+            t = torch.randint(self.min_step, self.max_step, (latents.shape[0],), dtype=torch.long, device=self.device)
 
         # predict the noise residual with unet, NO grad!
         with torch.no_grad():
@@ -208,16 +211,16 @@ class StableDiffusion(nn.Module):
             noise = torch.randn_like(latents)
 
             # from tqdm.auto import tqdm
-            # latents =noise
-            # latents = torch.cat([latents] * (1 + K))
-            # for t in tqdm(self.scheduler.timesteps):
+            # latents1 =noise
+            # latents1 = torch.cat([latents1] * (1 + K))
+            # for t1 in tqdm(self.scheduler.timesteps):
             #     # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
             #
-            #     latent_model_input = self.scheduler.scale_model_input(latents, timestep=t)
+            #     latent_model_input = self.scheduler.scale_model_input(latents1, timestep=t1)
             #     # t = torch.cat([t] * (1 + K))
             #     # predict the noise residual
             #     with torch.no_grad():
-            #         noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+            #         noise_pred = self.unet(latent_model_input, t1, encoder_hidden_states=text_embeddings).sample
             #
             #
             #     # perform guidance (high scale from paper!)
@@ -227,10 +230,10 @@ class StableDiffusion(nn.Module):
             #                                                                                         weights, B)
             #
             #     # compute the previous noisy sample x_t -> x_t-1
-            #     latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-            # latents = 1 / 0.18215 * latents
+            #     latents1 = self.scheduler.step(noise_pred, t1, latents1).prev_sample
+            # latents1 = 1 / 0.18215 * latents1
             # with torch.no_grad():
-            #     image = self.vae.decode(latents).sample
+            #     image = self.vae.decode(latents1).sample
             # image = (image / 2 + 0.5).clamp(0, 1)
             # image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
             # images = (image * 255).round().astype("uint8")

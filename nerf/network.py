@@ -3,12 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from activation import trunc_exp
-from .renderer import NeRFRenderer
 
 import numpy as np
 from encoding import get_encoder
 
-from .utils import safe_normalize
+from nerf.utils import safe_normalize
+from nerf.renderer import NeRFRenderer
 
 # TODO: not sure about the details...
 class ResBlock(nn.Module):

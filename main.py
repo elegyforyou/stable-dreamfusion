@@ -1,15 +1,19 @@
+import numpy as np
 import torch
 import argparse
 import pandas as pd
 import sys
 import importlib.util
 from typing import List, Dict, Any
+import os
 
+from torch import optim, nn
 from torchsummary import torchsummary
 
-from nerf.provider import NeRFDataset
 from nerf.utils import *
 from plenoxels.models.lowrank_model import LowrankModel
+from nerf.provider import NeRFDataset
+
 # torch.autograd.set_detect_anomaly(True)
 
 def initialize_kplanes(config,opt):
@@ -123,15 +127,15 @@ if __name__ == '__main__':
     parser.add_argument('--dt_gamma', type=float, default=0, help="dt_gamma (>=0) for adaptive ray marching. set to 0 to disable, >0 to accelerate rendering (but usually with worse quality)")
     parser.add_argument('--min_near', type=float, default=0.01, help="minimum near distance for camera")
 
-    parser.add_argument('--radius_range', type=float, nargs='*', default=[1.0, 1.5], help="training camera radius range")
-    parser.add_argument('--theta_range', type=float, nargs='*', default=[45, 105], help="training camera range along the polar angles (i.e. up and down). See advanced.md for details.")
+    parser.add_argument('--radius_range', type=float, nargs='*', default=[1, 1.5], help="training camera radius range")
+    parser.add_argument('--theta_range', type=float, nargs='*', default=[60, 135], help="training camera range along the polar angles (i.e. up and down). See advanced.md for details.")
     parser.add_argument('--phi_range', type=float, nargs='*', default=[-180, 180], help="training camera range along the azimuth angles (i.e. left and right). See advanced.md for details.")
-    parser.add_argument('--fovy_range', type=float, nargs='*', default=[10, 30], help="training camera fovy range")
+    parser.add_argument('--fovy_range', type=float, nargs='*', default=[20, 40], help="training camera fovy range")
 
-    parser.add_argument('--default_radius', type=float, default=1.2, help="radius for the default view")
+    parser.add_argument('--default_radius', type=float, default=1.5, help="radius for the default view")
     parser.add_argument('--default_polar', type=float, default=90, help="polar for the default view")
     parser.add_argument('--default_azimuth', type=float, default=0, help="azimuth for the default view")
-    parser.add_argument('--default_fovy', type=float, default=20, help="fovy for the default view")
+    parser.add_argument('--default_fovy', type=float, default=30, help="fovy for the default view")
 
     parser.add_argument('--progressive_view', action='store_true', help="progressively expand view sampling range from default to full")
     parser.add_argument('--progressive_view_init_ratio', type=float, default=0.2, help="initial ratio of final range, used for progressive_view")
@@ -146,7 +150,7 @@ if __name__ == '__main__':
 
     ### regularizations
     parser.add_argument('--lambda_entropy', type=float, default=1e-3, help="loss scale for alpha entropy")
-    parser.add_argument('--lambda_opacity', type=float, default=0, help="loss scale for alpha value")
+    parser.add_argument('--lambda_opacity', type=float, default=1e-3, help="loss scale for alpha value")
     parser.add_argument('--lambda_orient', type=float, default=1e-2, help="loss scale for orientation")
     parser.add_argument('--lambda_tv', type=float, default=0, help="loss scale for total variation")
     parser.add_argument('--lambda_wd', type=float, default=0, help="loss scale")
@@ -421,7 +425,7 @@ if __name__ == '__main__':
             from guidance.clip_utils import CLIP
             guidance['clip'] = CLIP(device)
         config.pop('device')
-        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer,scheduler=scheduler, ema_decay=0.95, fp16=opt.fp16, use_checkpoint=opt.ckpt, scheduler_update_every_step=True,**config)
+        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer,lr_scheduler=scheduler, ema_decay=0.95, fp16=opt.fp16, use_checkpoint=opt.ckpt, scheduler_update_every_step=True,**config)
 
         trainer.default_view_data = train_loader._data.get_default_view_data()
         #--ckpt scratch

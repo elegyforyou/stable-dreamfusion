@@ -33,7 +33,7 @@ from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
-from plenoxels.runners.regularization import Regularizer, PlaneTV, TimeSmoothness, L1TimePlanes, HistogramLoss, \
+from plenoxels.runners.regularization import  PlaneTV, TimeSmoothness, L1TimePlanes, HistogramLoss, \
     DistortionLoss
 
 
@@ -599,8 +599,8 @@ class Trainer(object):
         # near_far = near_far.repeat(N,1)
         rays_o = rays_o.contiguous().view(-1,N, 3).squeeze()
         rays_d = rays_d.contiguous().view(-1,N, 3).squeeze()
-        bg_color = torch.ones((1, 3), dtype=torch.float32, device=rays_d.device)
-        outputs = self.model(rays_o,rays_d,bg_color=bg_color,timestamps=timestamps,near_far=near_fars)
+        #bg_color = torch.ones((1, 3), dtype=torch.float32, device=rays_d.device)
+        outputs = self.model(rays_o,rays_d,bg_color=None,timestamps=timestamps,near_far=near_fars)
         #outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=False, perturb=True, bg_color=bg_color, ambient_ratio=ambient_ratio, shading=shading, binarize=binarize)
         #TODO:modify the result procedure
         pred_depth = outputs['depth'].reshape(B, 1, H, W)
@@ -697,7 +697,7 @@ class Trainer(object):
                     loss = loss + self.guidance['SD'].train_step_perpneg(ratio,text_z, weights, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
                                                     save_guidance_path=save_guidance_path)
                 else:
-                    loss = loss + self.guidance['SD'].train_step(text_z, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
+                    loss = loss + self.guidance['SD'].train_step(ratio,text_z, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
                                                                 save_guidance_path=save_guidance_path)
 
             if 'IF' in self.guidance:
@@ -749,23 +749,25 @@ class Trainer(object):
                 lambda_guidance = 10 * (1 - abs(azimuth) / 180) * self.opt.lambda_guidance
 
                 loss = loss + self.guidance['clip'].train_step(self.embeddings['clip'], pred_rgb, grad_scale=lambda_guidance)
+
         #TODO：regularization in k-planes
-        # for r in self.regularizers:
-        #     reg_loss = r.regularize(self.model, model_out=outputs)
-        #     loss = loss + reg_loss
+        if self.opt.lambda_opacity > 0:
+            loss_opacity = (outputs['accumulation'] ** 2).mean()
+            loss = loss + self.opt.lambda_opacity * loss_opacity
+
+        if self.opt.lambda_entropy > 0:
+            alphas = outputs['accumulation'].clamp(1e-5, 1 - 1e-5)
+            # alphas = alphas ** 2 # skewed entropy, favors 0 over 1
+            loss_entropy = (- alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).mean()
+            lambda_entropy = self.opt.lambda_entropy * min(1, 2 * self.global_step / self.opt.iters)
+            loss = loss + lambda_entropy * loss_entropy
+        for r in self.regularizers:
+            reg_loss = r.regularize(self.model, model_out=outputs)
+            loss = loss + reg_loss
         # regularizations
         # if not self.opt.dmtet:
         #
-        #     if self.opt.lambda_opacity > 0:
-        #         loss_opacity = (outputs['weights_sum'] ** 2).mean()
-        #         loss = loss + self.opt.lambda_opacity * loss_opacity
-        #
-        #     if self.opt.lambda_entropy > 0:
-        #         alphas = outputs['weights'].clamp(1e-5, 1 - 1e-5)
-        #         # alphas = alphas ** 2 # skewed entropy, favors 0 over 1
-        #         loss_entropy = (- alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).mean()
-        #         lambda_entropy = self.opt.lambda_entropy * min(1, 2 * self.global_step / self.opt.iters)
-        #         loss = loss + lambda_entropy * loss_entropy
+
         #
         #     if self.opt.lambda_2d_normal_smooth > 0 and 'normal_image' in outputs:
         #         # pred_vals = outputs['normal_image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
@@ -839,7 +841,7 @@ class Trainer(object):
         rays_o = rays_o.contiguous().view(-1, N, 3).squeeze()
         rays_d = rays_d.contiguous().view(-1, N, 3).squeeze()
 
-        outputs = self.model(rays_o.squeeze(),rays_d.squeeze(),bg_color=None,timestamps=timestamps,near_far=near_fars)
+        outputs = self.model(rays_o,rays_d,bg_color=None,timestamps=timestamps,near_far=near_fars)
         #outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=True, perturb=False, bg_color=None, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading)
         pred_rgb = outputs['rgb'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
@@ -880,7 +882,7 @@ class Trainer(object):
         rays_d = rays_d.contiguous().view(-1, N, 3).squeeze()
         bg_color = torch.ones((1, 3), dtype=torch.float32, device=rays_d.device)
 
-        outputs = self.model(rays_o.squeeze(),rays_d.squeeze(),bg_color=None,timestamps=timestamps,near_far=near_fars)
+        outputs = self.model(rays_o,rays_d,bg_color=None,timestamps=timestamps,near_far=near_fars)
 
         pred_rgb = outputs['rgb'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
@@ -1167,7 +1169,7 @@ class Trainer(object):
                 # pred_rgbs.retain_grad()
 
             self.scaler.scale(loss).backward()
-
+            #self.model.bg_net.net[0]
             self.post_train_step()
             self.scaler.step(self.optimizer)
             self.scaler.update()
