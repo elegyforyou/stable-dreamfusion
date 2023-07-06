@@ -3,6 +3,7 @@ build/
 *.egg-info/
 *.so
 venv_*/
+exp/
 
 tmp*
 # data/

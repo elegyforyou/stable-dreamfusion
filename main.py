@@ -11,8 +11,11 @@ from torch import optim, nn
 from torchsummary import torchsummary
 
 from nerf.utils import *
+from nerf.utils import *
+from nerf.video_utils import VideoTrainer
 from plenoxels.models.lowrank_model import LowrankModel
-from nerf.provider import NeRFDataset
+from nerf.provider import NeRFDataset, VideoDiffusionDataset
+
 
 # torch.autograd.set_detect_anomaly(True)
 
@@ -41,6 +44,17 @@ if __name__ == '__main__':
                 parser.parse_args(f.read().split(), namespace)
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('--video', action='store_true', help="use video diffusion ")
+    parser.add_argument('--vh', type=int, default=64, help="render height for NeRF in video training")
+    parser.add_argument('--vw', type=int, default=64, help="render height for NeRF in video training")
+    parser.add_argument('--model_key', type=str, default='damo-vilab/text-to-video-ms-1.7b', help="hugging face Video diffusion model key")
+    parser.add_argument('--num_frames', type=int, default=16)
+    parser.add_argument('--ckpt_path', type=str, default='', help="static model path")
+    parser.add_argument('--train_from_static', action='store_true', help="use video diffusion ")
+    parser.add_argument('--dataset_size_video_train', type=int, default=8, help="Length of train dataset i.e. # of iterations per epoch")
+
+
+
     parser.add_argument('--file', type=open, action=LoadFromFile, help="specify a file filled with more arguments")
     parser.add_argument('--text', default=None, help="text prompt")
     parser.add_argument('--negative', default='', type=str, help="negative text prompt")
@@ -48,7 +62,7 @@ if __name__ == '__main__':
     parser.add_argument('-O2', action='store_true', help="equals --backbone vanilla")
     parser.add_argument('--test', action='store_true', help="test mode")
     parser.add_argument('--six_views', action='store_true', help="six_views mode: save the images of the six views")
-    parser.add_argument('--eval_interval', type=int, default=1, help="evaluate on the valid set every interval epochs")
+    parser.add_argument('--eval_interval', type=int, default=20, help="evaluate on the valid set every interval epochs")
     parser.add_argument('--test_interval', type=int, default=100, help="test on the test set every interval epochs")
     parser.add_argument('--workspace', type=str, default='workspace')
     parser.add_argument('--seed', default=None)
@@ -384,6 +398,44 @@ if __name__ == '__main__':
         else:
             test_loader = NeRFDataset(opt, device=device, type='test', H=opt.H, W=opt.W, size=opt.dataset_size_test).dataloader(batch_size=1)
             trainer.test(test_loader)
+
+            if opt.save_mesh:
+                trainer.save_mesh()
+
+    elif opt.video:
+        #TODO 修改collate函数使其可以产生一段视频
+        train_loader = VideoDiffusionDataset(opt, device=device, type='video', H=opt.vh, W=opt.vh,
+                                   size=opt.dataset_size_video_train * opt.batch_size,num_frames=opt.num_frames).dataloader()
+        if opt.optim == 'adan':
+            from optimizer import Adan
+            # Adan usually requires a larger LR
+            optimizer = lambda model: Adan(model.get_params(5 * opt.lr), eps=1e-8, weight_decay=2e-5, max_grad_norm=5.0, foreach=False)
+        else: # adam
+            optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
+
+        #TODO：modify the original scheduler initialization
+
+        if opt.backbone == 'vanilla':
+            scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
+        else:
+            scheduler = lambda optimizer: torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=100,eta_min=0.001)
+            # scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
+        guidance = nn.ModuleDict()
+        from guidance.vd_utils import VideoDiffusion
+        guidance['VD'] = VideoDiffusion(device, opt.fp16, opt.vram_O, opt.model_key, opt.t_range)
+        config.pop('device')
+        trainer = VideoTrainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, static_ckpt_path=opt.ckpt_path,optimizer=optimizer,lr_scheduler=scheduler, ema_decay=0.95, fp16=opt.fp16, use_checkpoint=opt.ckpt, scheduler_update_every_step=True,**config)
+        if opt.gui:
+            from nerf.gui import NeRFGUI
+            gui = NeRFGUI(opt, trainer, train_loader)
+            gui.render()
+
+        else:
+            valid_loader = VideoDiffusionDataset(opt, device=device, type='val', H=opt.vh, W=opt.vw, size=3).dataloader(batch_size=1)
+            test_loader = VideoDiffusionDataset(opt, device=device, type='test', H=opt.vh, W=opt.vw, size=2).dataloader(batch_size=1)
+
+            max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
+            trainer.train(train_loader, valid_loader, test_loader, max_epoch)
 
             if opt.save_mesh:
                 trainer.save_mesh()

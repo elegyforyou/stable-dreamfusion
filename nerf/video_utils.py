@@ -41,11 +41,10 @@ def adjust_text_embeddings(embeddings, azimuth, opt):
     text_z_list = []
     weights_list = []
     K = 0
-    for b in range(azimuth.shape[0]):
-        text_z_, weights_ = get_pos_neg_text_embeddings(embeddings, azimuth[b], opt)
-        K = max(K, weights_.shape[0])
-        text_z_list.append(text_z_)
-        weights_list.append(weights_)
+    text_z_, weights_ = get_pos_neg_text_embeddings(embeddings, azimuth, opt)
+    K = max(K, weights_.shape[0])
+    text_z_list.append(text_z_)
+    weights_list.append(weights_)
 
     # Interleave text_embeddings from different dirs to form a batch
     text_embeddings = []
@@ -116,7 +115,7 @@ def safe_normalize(x, eps=1e-20):
     return x / torch.sqrt(torch.clamp(torch.sum(x * x, -1, keepdim=True), min=eps))
 
 @torch.cuda.amp.autocast(enabled=False)
-def get_rays(poses, intrinsics, H, W, N=-1, error_map=None):
+def get_video_rays(poses, intrinsics, H, W, N=-1, error_map=None):
     ''' get rays
     Args:
         poses: [B, 4, 4], cam2world
@@ -129,7 +128,7 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None):
     '''
 
     device = poses.device
-    B = poses.shape[0]
+    B = poses.shape[1]
     fx, fy, cx, cy = intrinsics
 
     i, j = custom_meshgrid(torch.linspace(0, W-1, W, device=device), torch.linspace(0, H-1, H, device=device))
@@ -180,6 +179,72 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None):
     results['rays_d'] = rays_d
 
     return results
+@torch.cuda.amp.autocast(enabled=False)
+def get_video_rays(poses, intrinsics, H, W, N=-1, error_map=None):
+    ''' get rays
+    Args:
+        poses: [num_frames,B, 4, 4], cam2world
+        intrinsics: [4]
+        H, W, N: int
+        error_map: [B, 128 * 128], sample probability based on training error
+    Returns:
+        rays_o, rays_d: [num_frames,B, N, 3]
+        inds: [B, N]
+    '''
+
+    device = poses.device
+    B = poses.shape[1]
+    fx, fy, cx, cy = intrinsics
+
+    i, j = custom_meshgrid(torch.linspace(0, W-1, W, device=device), torch.linspace(0, H-1, H, device=device))
+    i = i.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
+    j = j.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
+
+    results = {}
+
+    if N > 0:
+        N = min(N, H*W)
+
+        if error_map is None:
+            inds = torch.randint(0, H*W, size=[N], device=device) # may duplicate
+            inds = inds.expand([B, N])
+        else:
+
+            # weighted sample on a low-reso grid
+            inds_coarse = torch.multinomial(error_map.to(device), N, replacement=False) # [B, N], but in [0, 128*128)
+
+            # map to the original resolution with random perturb.
+            inds_x, inds_y = inds_coarse // 128, inds_coarse % 128 # `//` will throw a warning in torch 1.10... anyway.
+            sx, sy = H / 128, W / 128
+            inds_x = (inds_x * sx + torch.rand(B, N, device=device) * sx).long().clamp(max=H - 1)
+            inds_y = (inds_y * sy + torch.rand(B, N, device=device) * sy).long().clamp(max=W - 1)
+            inds = inds_x * W + inds_y
+
+            results['inds_coarse'] = inds_coarse # need this when updating error_map
+
+        i = torch.gather(i, -1, inds)
+        j = torch.gather(j, -1, inds)
+
+        results['inds'] = inds
+
+    else:
+        inds = torch.arange(H*W, device=device).expand([B, H*W])
+
+    zs = - torch.ones_like(i)
+    xs = - (i - cx) / fx * zs
+    ys = (j - cy) / fy * zs
+    directions = torch.stack((xs, ys, zs), dim=-1)
+    # directions = safe_normalize(directions)
+    rays_d = directions @ poses[:,:, :3, :3].transpose(-1, -2) # (num_frames,B, N, 3)
+
+    rays_o = poses[..., :3, 3] # [B, 3]
+    rays_o = rays_o[..., None, :].expand_as(rays_d) # [B, N, 3]
+
+    results['rays_o'] = rays_o
+    results['rays_d'] = rays_d
+
+    return results
+
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -218,7 +283,7 @@ def srgb_to_linear(x):
     return torch.where(x < 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
 
 
-class Trainer(object):
+class VideoTrainer(object):
     def __init__(self,
 		         argv, # command line args
                  name, # name of this experiment
@@ -237,6 +302,7 @@ class Trainer(object):
                  fp16=False, # amp optimize level
                  max_keep_ckpt=2, # max num of saved ckpts in disk
                  workspace='workspace', # workspace to save logs & ckpts
+                 static_ckpt_path='ckpt',
                  best_mode='min', # the smaller/larger result, the better
                  use_loss_as_metric=True, # use loss as the first metric
                  report_metric_at_train=False, # also report metrics at training
@@ -273,13 +339,9 @@ class Trainer(object):
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
         self.model = model
+        self.static_ckpt_path = static_ckpt_path
 
-        #TODO：time plane frozen
-        for plane_idx in [2, 4, 5]:  # time-grids off
-            for i in range(len(model.field.grids)):
-                self.model.field.grids[i][plane_idx].requires_grad = False
-            for i in range(len(model.proposal_networks)):
-                self.model.proposal_networks[i].grids[plane_idx].requires_grad = False
+
 
         # guide model
         self.guidance = guidance
@@ -361,26 +423,36 @@ class Trainer(object):
         self.log(f'[INFO] opt: {self.opt}')
         self.log(f'[INFO] Trainer: {self.name} | {self.time_stamp} | {self.device} | {"fp16" if self.fp16 else "fp32"} | {self.workspace}')
         self.log(f'[INFO] #parameters: {sum([p.numel() for p in model.parameters() if p.requires_grad])}')
-
-        if self.workspace is not None:
-            if self.use_checkpoint == "scratch":
-                self.log("[INFO] Training from scratch ...")
-            elif self.use_checkpoint == "latest":
-                self.log("[INFO] Loading latest checkpoint ...")
-                self.load_checkpoint()
-            elif self.use_checkpoint == "latest_model":
-                self.log("[INFO] Loading latest checkpoint (model only)...")
-                self.load_checkpoint(model_only=True)
-            elif self.use_checkpoint == "best":
-                if os.path.exists(self.best_path):
-                    self.log("[INFO] Loading best checkpoint ...")
-                    self.load_checkpoint(self.best_path)
-                else:
-                    self.log(f"[INFO] {self.best_path} not found, loading latest ...")
+        if opt.train_from_static == True:
+            self.load_static_checkpoint(model_only=True)
+        else:
+            if self.workspace is not None:
+                if self.use_checkpoint == "scratch":
+                    self.log("[INFO] Training from scratch ...")
+                elif self.use_checkpoint == "latest":
+                    self.log("[INFO] Loading latest checkpoint ...")
                     self.load_checkpoint()
-            else: # path to ckpt
-                self.log(f"[INFO] Loading {self.use_checkpoint} ...")
-                self.load_checkpoint(self.use_checkpoint)
+                elif self.use_checkpoint == "latest_model":
+                    self.log("[INFO] Loading latest checkpoint (model only)...")
+                    self.load_checkpoint(model_only=True)
+                elif self.use_checkpoint == "best":
+                    if os.path.exists(self.best_path):
+                        self.log("[INFO] Loading best checkpoint ...")
+                        self.load_checkpoint(self.best_path)
+                    else:
+                        self.log(f"[INFO] {self.best_path} not found, loading latest ...")
+                        self.load_checkpoint()
+                else:  # path to ckpt
+                    self.log(f"[INFO] Loading {self.use_checkpoint} ...")
+                    self.load_checkpoint(self.use_checkpoint)
+
+        # TODO：time plane frozen
+        for plane_idx in [2, 4, 5]:  # time-grids off
+            for i in range(len(model.field.grids)):
+                self.model.field.grids[i][plane_idx].requires_grad = True
+            for i in range(len(model.proposal_networks)):
+                self.model.proposal_networks[i].grids[plane_idx].requires_grad = True
+
 
     def init_regularizers(self, **kwargs):
         # Keep only the regularizers with a positive weight
@@ -405,22 +477,12 @@ class Trainer(object):
         # text embeddings (stable-diffusion)
         if self.opt.text is not None:
 
-            if 'SD' in self.guidance:
-                self.embeddings['SD']['default'] = self.guidance['SD'].get_text_embeds([self.opt.text])
-                self.embeddings['SD']['uncond'] = self.guidance['SD'].get_text_embeds([self.opt.negative])
+            if 'VD' in self.guidance:
+                self.embeddings['VD']['default'] = self.guidance['VD'].get_text_embeds([self.opt.text])
+                self.embeddings['VD']['uncond'] = self.guidance['VD'].get_text_embeds([self.opt.negative])
 
                 for d in ['front', 'side', 'back']:
-                    self.embeddings['SD'][d] = self.guidance['SD'].get_text_embeds([f"{self.opt.text}, {d} view"])
-
-            if 'IF' in self.guidance:
-                self.embeddings['IF']['default'] = self.guidance['IF'].get_text_embeds([self.opt.text])
-                self.embeddings['IF']['uncond'] = self.guidance['IF'].get_text_embeds([self.opt.negative])
-
-                for d in ['front', 'side', 'back']:
-                    self.embeddings['IF'][d] = self.guidance['IF'].get_text_embeds([f"{self.opt.text}, {d} view"])
-
-            if 'clip' in self.guidance:
-                self.embeddings['clip']['text'] = self.guidance['clip'].get_text_embeds(self.opt.text)
+                    self.embeddings['VD'][d] = self.guidance['VD'].get_text_embeds([f"{self.opt.text}, {d} view"])
 
         if self.opt.images is not None:
 
@@ -521,11 +583,11 @@ class Trainer(object):
         if self.opt.progressive_level:
             self.model.max_level = min(1.0, 0.25 + 2.0*exp_iter_ratio)
 
-        rays_o = data['rays_o'] # [B, N, 3]
-        rays_d = data['rays_d'] # [B, N, 3]
-        mvp = data['mvp'] # [B, 4, 4]
+        rays_o = data['rays_o'] # [num_frames,B, N, 3]
+        rays_d = data['rays_d'] # [num_frames,B, N, 3]
+        #mvp = data['mvp'] # [B, 4, 4]
 
-        B, N = rays_o.shape[:2]
+        num,B, N = rays_o.shape[:3]
         H, W = data['H'], data['W']
 
         # When ref_data has B images > opt.batch_size
@@ -535,59 +597,12 @@ class Trainer(object):
             B = self.opt.batch_size
             rays_o = rays_o[choice]
             rays_d = rays_d[choice]
-            mvp = mvp[choice]
-
-        # if do_rgbd_loss:
-        #     ambient_ratio = 1.0
-        #     shading = 'lambertian' # use lambertian instead of albedo to get normal
-        #     as_latent = False
-        #     binarize = False
-        #     bg_color = torch.rand((B * N, 3), device=rays_o.device)
-        #
-        #     # add camera noise to avoid grid-like artifact
-        #     if self.opt.known_view_noise_scale > 0:
-        #         noise_scale = self.opt.known_view_noise_scale #* (1 - self.global_step / self.opt.iters)
-        #         rays_o = rays_o + torch.randn(3, device=self.device) * noise_scale
-        #         rays_d = rays_d + torch.randn(3, device=self.device) * noise_scale
-        #
-        # elif exp_iter_ratio <= self.opt.latent_iter_ratio:
-        #     ambient_ratio = 1.0
-        #     shading = 'normal'
-        #     as_latent = True
-        #     binarize = False
-        #     bg_color = None
-        #
-        # else:
-        #     if exp_iter_ratio <= self.opt.albedo_iter_ratio:
-        #         ambient_ratio = 1.0
-        #         shading = 'albedo'
-        #     else:
-        #         # random shading
-        #         ambient_ratio = self.opt.min_ambient_ratio + (1.0-self.opt.min_ambient_ratio) * random.random()
-        #         rand = random.random()
-        #         if rand >= (1.0 - self.opt.textureless_ratio):
-        #             shading = 'textureless'
-        #         else:
-        #             shading = 'lambertian'
-        #
-        #     as_latent = False
-        #
-        #     # random weights binarization (like mobile-nerf) [NOT WORKING NOW]
-        #     # binarize_thresh = min(0.5, -0.5 + self.global_step / self.opt.iters)
-        #     # binarize = random.random() < binarize_thresh
-        #     binarize = False
-        #
-        #     # random background
-        #     rand = random.random()
-        #     if self.opt.bg_radius > 0 and rand > 0.5:
-        #         bg_color = None # use bg_net
-        #     else:
-        #         bg_color = torch.rand(3).to(self.device) # single color random bg
+            # mvp = mvp[choice]
         #TODO:modify the render procedure
         as_latent = False
         rays_o = torch.squeeze(rays_o)
         rays_d = torch.squeeze(rays_d)
-        timestamps = torch.zeros(rays_o.shape[0]).to(rays_d.device)
+        timestamps = data['timestamps']
         rays_o = rays_o.contiguous().view(-1, 3)
         rays_d = rays_d.contiguous().view(-1, 3)
         # pre-calculate near far
@@ -595,13 +610,13 @@ class Trainer(object):
         near_fars = torch.cat([nears.unsqueeze(1),fars.unsqueeze(1)],dim=1)
         # near_far = torch.tensor([0.4,2.6]).to(rays_d.device)
         # near_far = near_far.repeat(N,1)
-        rays_o = rays_o.contiguous().view(-1,N, 3).squeeze()
-        rays_d = rays_d.contiguous().view(-1,N, 3).squeeze()
+        rays_o = rays_o.contiguous().view(-1, 3).squeeze()
+        rays_d = rays_d.contiguous().view(-1, 3).squeeze()
         #bg_color = torch.ones((1, 3), dtype=torch.float32, device=rays_d.device)
-        outputs = self.model(rays_o,rays_d,bg_color=None,timestamps=timestamps,near_far=near_fars)
+        outputs = self.model(rays_o,rays_d,bg_color=None,timestamps=timestamps.squeeze().flatten(),near_far=near_fars)
         #outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=False, perturb=True, bg_color=bg_color, ambient_ratio=ambient_ratio, shading=shading, binarize=binarize)
         #TODO:modify the result procedure
-        pred_depth = outputs['depth'].reshape(B, 1, H, W)
+        pred_depth = outputs['depth'].reshape(num,B, 1, H, W)
         #pred_mask = outputs['weights_sum'].reshape(B, 1, H, W)
         if 'normal_image' in outputs:
             pred_normal = outputs['normal_image'].reshape(B, H, W, 3)
@@ -610,143 +625,53 @@ class Trainer(object):
             # abuse normal & mask as latent code for faster geometry initialization (ref: fantasia3D)
             pred_rgb = torch.cat([outputs['rgb'], outputs['accumulation']], dim=-1).reshape(B, H, W, 4).permute(0, 3, 1, 2).contiguous() # [B, 4, H, W]
         else:
-            pred_rgb = outputs['rgb'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous() # [B, 3, H, W]
+            # pred_rgb = outputs['rgb'].reshape(num,B, H, W, 3).permute(0, 3, 1, 2).contiguous() # [B, 3, H, W]
+            pred_rgb = outputs['rgb'].reshape(num,B, H, W, 3) # [num,B, 3, H, W]
 
         # known view loss
         if do_rgbd_loss:
-            gt_mask = self.mask # [B, H, W]
-            gt_rgb = self.rgb   # [B, 3, H, W]
-            gt_normal = self.normal # [B, H, W, 3]
-            gt_depth = self.depth   # [B, H, W]
-
-            if len(gt_rgb) > self.opt.batch_size:
-                gt_mask = gt_mask[choice]
-                gt_rgb = gt_rgb[choice]
-                gt_normal = gt_normal[choice]
-                gt_depth = gt_depth[choice]
-
-            # color loss
-            gt_rgb = gt_rgb * gt_mask[:, None].float() + bg_color.reshape(B, H, W, 3).permute(0,3,1,2).contiguous() * (1 - gt_mask[:, None].float())
-            loss = self.opt.lambda_rgb * F.mse_loss(pred_rgb, gt_rgb)
-
-            # mask loss
-            loss = loss + self.opt.lambda_mask * F.mse_loss(pred_mask[:, 0], gt_mask.float())
-
-            # normal loss
-            if self.opt.lambda_normal > 0 and 'normal_image' in outputs:
-                valid_gt_normal = 1 - 2 * gt_normal[gt_mask] # [B, 3]
-                valid_pred_normal = 2 * pred_normal[gt_mask] - 1 # [B, 3]
-
-                lambda_normal = self.opt.lambda_normal * min(1, self.global_step / self.opt.iters)
-                loss = loss + lambda_normal * (1 - F.cosine_similarity(valid_pred_normal, valid_gt_normal).mean())
-
-            # relative depth loss
-            if self.opt.lambda_depth > 0:
-                valid_gt_depth = gt_depth[gt_mask] # [B,]
-                valid_pred_depth = pred_depth[:, 0][gt_mask] # [B,]
-                lambda_depth = self.opt.lambda_depth * min(1, self.global_step / self.opt.iters)
-                loss = loss + lambda_depth * (1 - self.pearson(valid_pred_depth, valid_gt_depth))
-
-                # # scale-invariant
-                # with torch.no_grad():
-                #     A = torch.cat([valid_gt_depth, torch.ones_like(valid_gt_depth)], dim=-1) # [B, 2]
-                #     X = torch.linalg.lstsq(A, valid_pred_depth).solution # [2, 1]
-                #     valid_gt_depth = A @ X # [B, 1]
-                # lambda_depth = self.opt.lambda_depth #* min(1, self.global_step / self.opt.iters)
-                # loss = loss + lambda_depth * F.mse_loss(valid_pred_depth, valid_gt_depth)
-
+            pass
         # novel view loss
         else:
 
             loss = 0
 
-            if 'SD' in self.guidance:
+            if 'VD' in self.guidance:
                 # interpolate text_z
-                azimuth = data['azimuth'] # [-180, 180]
+                azimuth = torch.mean(torch.stack(data['azimuth'])).item() # [-180, 180]
 
                 # ENHANCE: remove loop to handle batch size > 1
-                text_z = [self.embeddings['SD']['uncond']] * azimuth.shape[0]
+                text_z = [self.embeddings['VD']['uncond']]
                 if self.opt.perpneg:
 
-                    text_z_comp, weights = adjust_text_embeddings(self.embeddings['SD'], azimuth, self.opt)
+                    text_z_comp, weights = adjust_text_embeddings(self.embeddings['VD'], azimuth, self.opt)
                     text_z.append(text_z_comp)
 
                 else:                
-                    for b in range(azimuth.shape[0]):
-                        if azimuth[b] >= -90 and azimuth[b] < 90:
-                            if azimuth[b] >= 0:
-                                r = 1 - azimuth[b] / 90
-                            else:
-                                r = 1 + azimuth[b] / 90
-                            start_z = self.embeddings['SD']['front']
-                            end_z = self.embeddings['SD']['side']
+                    if azimuth >= -90 and azimuth < 90:
+                        if azimuth >= 0:
+                            r = 1 - azimuth / 90
                         else:
-                            if azimuth[b] >= 0:
-                                r = 1 - (azimuth[b] - 90) / 90
-                            else:
-                                r = 1 + (azimuth[b] + 90) / 90
-                            start_z = self.embeddings['SD']['side']
-                            end_z = self.embeddings['SD']['back']
-                        text_z.append(r * start_z + (1 - r) * end_z)
+                            r = 1 + azimuth / 90
+                        start_z = self.embeddings['VD']['front']
+                        end_z = self.embeddings['VD']['side']
+                    else:
+                        if azimuth >= 0:
+                            r = 1 - (azimuth - 90) / 90
+                        else:
+                            r = 1 + (azimuth + 90) / 90
+                        start_z = self.embeddings['VD']['side']
+                        end_z = self.embeddings['VD']['back']
+                    text_z.append(r * start_z + (1 - r) * end_z)
 
                 text_z = torch.cat(text_z, dim=0)
                 ratio = self.epoch/self.max_epochs
                 if self.opt.perpneg:
-                    loss = loss + self.guidance['SD'].train_step_perpneg(ratio,text_z, weights, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
+                    loss = loss + self.guidance['VD'].train_step_perpneg(ratio,text_z, weights, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
                                                     save_guidance_path=save_guidance_path)
                 else:
-                    loss = loss + self.guidance['SD'].train_step(ratio,text_z, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
+                    loss = loss + self.guidance['VD'].train_step(ratio,text_z, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
                                                                 save_guidance_path=save_guidance_path)
-
-            if 'IF' in self.guidance:
-                # interpolate text_z
-                azimuth = data['azimuth'] # [-180, 180]
-
-                # ENHANCE: remove loop to handle batch size > 1
-                text_z = [self.embeddings['IF']['uncond']] * azimuth.shape[0]
-                if self.opt.perpneg:
-                    text_z_comp, weights = adjust_text_embeddings(self.embeddings['IF'], azimuth, self.opt)
-                    text_z.append(text_z_comp)
-                else:
-                    for b in range(azimuth.shape[0]):
-                        if azimuth[b] >= -90 and azimuth[b] < 90:
-                            if azimuth[b] >= 0:
-                                r = 1 - azimuth[b] / 90
-                            else:
-                                r = 1 + azimuth[b] / 90
-                            start_z = self.embeddings['IF']['front']
-                            end_z = self.embeddings['IF']['side']
-                        else:
-                            if azimuth[b] >= 0:
-                                r = 1 - (azimuth[b] - 90) / 90
-                            else:
-                                r = 1 + (azimuth[b] + 90) / 90
-                            start_z = self.embeddings['IF']['side']
-                            end_z = self.embeddings['IF']['back']
-                        text_z.append(r * start_z + (1 - r) * end_z)
-
-                text_z = torch.cat(text_z, dim=0)
-
-                if self.opt.perpneg:
-                    loss = loss + self.guidance['IF'].train_step_perpneg(text_z, weights, pred_rgb, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance)
-                else:
-                    loss = loss + self.guidance['IF'].train_step(text_z, pred_rgb, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance)
-                    
-            if 'zero123' in self.guidance:
-
-                polar = data['polar']
-                azimuth = data['azimuth']
-                radius = data['radius']
-
-                loss = loss + self.guidance['zero123'].train_step(self.embeddings['zero123']['default'], pred_rgb, polar, azimuth, radius, guidance_scale=self.opt.guidance_scale,
-                                                                  as_latent=as_latent, grad_scale=self.opt.lambda_guidance, save_guidance_path=save_guidance_path)
-
-            if 'clip' in self.guidance:
-
-                # empirical, far view should apply smaller CLIP loss
-                lambda_guidance = 10 * (1 - abs(azimuth) / 180) * self.opt.lambda_guidance
-
-                loss = loss + self.guidance['clip'].train_step(self.embeddings['clip'], pred_rgb, grad_scale=lambda_guidance)
 
         #TODO：regularization in k-planes
         if self.opt.lambda_opacity > 0:
@@ -762,35 +687,6 @@ class Trainer(object):
         for r in self.regularizers:
             reg_loss = r.regularize(self.model, model_out=outputs)
             loss = loss + reg_loss
-        # regularizations
-        # if not self.opt.dmtet:
-        #
-
-        #
-        #     if self.opt.lambda_2d_normal_smooth > 0 and 'normal_image' in outputs:
-        #         # pred_vals = outputs['normal_image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
-        #         # smoothed_vals = TF.gaussian_blur(pred_vals.detach(), kernel_size=9)
-        #         # loss_smooth = F.mse_loss(pred_vals, smoothed_vals)
-        #         # total-variation
-        #         loss_smooth = (pred_normal[:, 1:, :, :] - pred_normal[:, :-1, :, :]).square().mean() + \
-        #                       (pred_normal[:, :, 1:, :] - pred_normal[:, :, :-1, :]).square().mean()
-        #         loss = loss + self.opt.lambda_2d_normal_smooth * loss_smooth
-        #
-        #     if self.opt.lambda_orient > 0 and 'loss_orient' in outputs:
-        #         loss_orient = outputs['loss_orient']
-        #         loss = loss + self.opt.lambda_orient * loss_orient
-        #
-        #     if self.opt.lambda_3d_normal_smooth > 0 and 'loss_normal_perturb' in outputs:
-        #         loss_normal_perturb = outputs['loss_normal_perturb']
-        #         loss = loss + self.opt.lambda_3d_normal_smooth * loss_normal_perturb
-        #
-        # else:
-        #
-        #     if self.opt.lambda_mesh_normal > 0:
-        #         loss = loss + self.opt.lambda_mesh_normal * outputs['normal_loss']
-        #
-        #     if self.opt.lambda_mesh_laplacian > 0:
-        #         loss = loss + self.opt.lambda_mesh_laplacian * outputs['lap_loss']
 
         return pred_rgb, pred_depth, loss
 
@@ -814,21 +710,26 @@ class Trainer(object):
 
     def eval_step(self, data):
 
-        rays_o = data['rays_o'] # [B, N, 3]
-        rays_d = data['rays_d'] # [B, N, 3]
-        mvp = data['mvp']
+        rays_o = data['rays_o']  # [num_frames,B, N, 3]
+        rays_d = data['rays_d']  # [num_frames,B, N, 3]
+        # mvp = data['mvp'] # [B, 4, 4]
 
-        B, N = rays_o.shape[:2]
+        num, B, N = rays_o.shape[:3]
         H, W = data['H'], data['W']
 
-        # shading = data['shading'] if 'shading' in data else 'albedo'
-        # ambient_ratio = data['ambient_ratio'] if 'ambient_ratio' in data else 1.0
-        # light_d = data['light_d'] if 'light_d' in data else None
-
+        # When ref_data has B images > opt.batch_size
+        if B > self.opt.batch_size:
+            # choose batch_size images out of those B images
+            choice = torch.randperm(B)[:self.opt.batch_size]
+            B = self.opt.batch_size
+            rays_o = rays_o[choice]
+            rays_d = rays_d[choice]
+            # mvp = mvp[choice]
         # TODO:modify the render procedure
+        as_latent = False
         rays_o = torch.squeeze(rays_o)
         rays_d = torch.squeeze(rays_d)
-        timestamps = torch.zeros(rays_o.shape[0]).to(rays_d.device)
+        timestamps = data['timestamps']
         rays_o = rays_o.contiguous().view(-1, 3)
         rays_d = rays_d.contiguous().view(-1, 3)
         # pre-calculate near far
@@ -836,13 +737,14 @@ class Trainer(object):
         near_fars = torch.cat([nears.unsqueeze(1), fars.unsqueeze(1)], dim=1)
         # near_far = torch.tensor([0.4,2.6]).to(rays_d.device)
         # near_far = near_far.repeat(N,1)
-        rays_o = rays_o.contiguous().view(-1, N, 3).squeeze()
-        rays_d = rays_d.contiguous().view(-1, N, 3).squeeze()
-
-        outputs = self.model(rays_o,rays_d,bg_color=None,timestamps=timestamps,near_far=near_fars)
+        rays_o = rays_o.contiguous().view(-1, 3).squeeze()
+        rays_d = rays_d.contiguous().view(-1, 3).squeeze()
+        # bg_color = torch.ones((1, 3), dtype=torch.float32, device=rays_d.device)
+        outputs = self.model(rays_o, rays_d, bg_color=None, timestamps=timestamps.squeeze().flatten(),
+                             near_far=near_fars)
         #outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=True, perturb=False, bg_color=None, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading)
-        pred_rgb = outputs['rgb'].reshape(B, H, W, 3)
-        pred_depth = outputs['depth'].reshape(B, H, W)
+        pred_rgb = outputs['rgb'].reshape(num, B, H, W, 3)  # [num,B, 3, H, W]
+        pred_depth = outputs['depth'].reshape(num,B, 1, H, W)
 
         # dummy
         loss = torch.zeros([1], device=pred_rgb.device, dtype=pred_rgb.dtype)
@@ -852,7 +754,7 @@ class Trainer(object):
     def test_step(self, data, bg_color=None, perturb=False):
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
-        mvp = data['mvp']
+        #mvp = data['mvp']
 
         B, N = rays_o.shape[:2]
         H, W = data['H'], data['W']
@@ -908,7 +810,7 @@ class Trainer(object):
         if self.use_tensorboardX and self.local_rank == 0:
 
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
-            self.guidance['SD'].writer = self.writer
+            self.guidance['VD'].writer = self.writer
         start_t = time.time()
 
         for epoch in range(self.epoch + 1, max_epochs + 1):
@@ -923,8 +825,8 @@ class Trainer(object):
                 self.evaluate_one_epoch(valid_loader)
                 self.save_checkpoint(full=False, best=True)
 
-            if self.epoch % self.opt.test_interval == 0 or self.epoch == max_epochs:
-                self.test(test_loader)
+            # if self.epoch % self.opt.test_interval == 0 or self.epoch == max_epochs:
+            #     self.test(test_loader)
             torch.cuda.empty_cache()
 
         end_t = time.time()
@@ -1144,7 +1046,7 @@ class Trainer(object):
 
             self.local_step += 1
             self.global_step += 1
-            self.guidance['SD'].global_step = self.global_step
+            self.guidance['VD'].global_step = self.global_step
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
@@ -1186,7 +1088,7 @@ class Trainer(object):
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
-                    self.writer.add_image("preds_rgb",pred_rgbs,global_step=self.global_step,dataformats='NCHW')
+                    self.writer.add_image("preds_rgb",pred_rgbs[0].permute(0,3,1,2),global_step=self.global_step,dataformats='NCHW')
                     # grid0 = self.model.field.grids[0][0].cpu().detach().numpy()
                     # grid0 = torch.from_numpy(grid0)
                     # grids = [None]*6
@@ -1282,21 +1184,24 @@ class Trainer(object):
                 if self.local_rank == 0:
 
                     # save image
-                    save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.png')
-                    save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
+                    save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.mp4')
+                    save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.mp4')
 
                     #self.log(f"==> Saving validation image to {save_path}")
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-                    pred = preds[0].detach().cpu().numpy()
+                    pred = preds.detach().cpu().numpy()
                     pred = (pred * 255).astype(np.uint8)
 
-                    pred_depth = preds_depth[0].detach().cpu().numpy()
+                    pred_depth = preds_depth.squeeze(1).permute(0,2,3,1)
+                    pred_depth = pred_depth.detach().cpu().numpy()
                     pred_depth = (pred_depth - pred_depth.min()) / (pred_depth.max() - pred_depth.min() + 1e-6)
                     pred_depth = (pred_depth * 255).astype(np.uint8)
 
-                    cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(save_path_depth, pred_depth)
+                    imageio.mimwrite(save_path, pred.squeeze(), fps=8, quality=8, macro_block_size=1)
+                    imageio.mimwrite(save_path_depth, pred_depth, fps=8, quality=8, macro_block_size=1)
+                    # cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
+                    # cv2.imwrite(save_path_depth, pred_depth)
 
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                     pbar.update(loader.batch_size)
@@ -1383,6 +1288,70 @@ class Trainer(object):
                     torch.save(state, self.best_path)
             else:
                 self.log(f"[WARN] no evaluated results found, skip saving best checkpoint.")
+
+    def load_static_checkpoint(self, checkpoint=None, model_only=False):
+        if checkpoint is None:
+            checkpoint_list = sorted(glob.glob(f'{self.static_ckpt_path}/*.pth'))
+            if checkpoint_list:
+                checkpoint = checkpoint_list[-1]
+                self.log(f"[INFO] Latest checkpoint is {checkpoint}")
+            else:
+                self.log("[WARN] No checkpoint found, model randomly initialized.")
+                return
+
+        checkpoint_dict = torch.load(checkpoint, map_location=self.device)
+
+        if 'model' not in checkpoint_dict:
+            self.model.load_state_dict(checkpoint_dict)
+            self.log("[INFO] loaded model.")
+            return
+
+        missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint_dict['model'], strict=False)
+        self.log("[INFO] loaded model.")
+        if len(missing_keys) > 0:
+            self.log(f"[WARN] missing keys: {missing_keys}")
+        if len(unexpected_keys) > 0:
+            self.log(f"[WARN] unexpected keys: {unexpected_keys}")
+
+        if self.ema is not None and 'ema' in checkpoint_dict:
+            try:
+                self.ema.load_state_dict(checkpoint_dict['ema'])
+                self.log("[INFO] loaded EMA.")
+            except:
+                self.log("[WARN] failed to loaded EMA.")
+
+        if self.model.cuda_ray:
+            if 'mean_density' in checkpoint_dict:
+                self.model.mean_density = checkpoint_dict['mean_density']
+
+        if model_only:
+            return
+
+        self.stats = checkpoint_dict['stats']
+        self.epoch = checkpoint_dict['epoch']
+        self.global_step = checkpoint_dict['global_step']
+        self.log(f"[INFO] load at epoch {self.epoch}, global step {self.global_step}")
+
+        if self.optimizer and 'optimizer' in checkpoint_dict:
+            try:
+                self.optimizer.load_state_dict(checkpoint_dict['optimizer'])
+                self.log("[INFO] loaded optimizer.")
+            except:
+                self.log("[WARN] Failed to load optimizer.")
+
+        if self.lr_scheduler and 'lr_scheduler' in checkpoint_dict:
+            try:
+                self.lr_scheduler.load_state_dict(checkpoint_dict['lr_scheduler'])
+                self.log("[INFO] loaded scheduler.")
+            except:
+                self.log("[WARN] Failed to load scheduler.")
+
+        if self.scaler and 'scaler' in checkpoint_dict:
+            try:
+                self.scaler.load_state_dict(checkpoint_dict['scaler'])
+                self.log("[INFO] loaded scaler.")
+            except:
+                self.log("[WARN] Failed to load scaler.")
 
     def load_checkpoint(self, checkpoint=None, model_only=False):
         if checkpoint is None:

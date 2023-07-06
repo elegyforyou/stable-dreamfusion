@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .utils import get_rays, safe_normalize
+from .video_utils import get_video_rays
 
 DIR_COLORS = np.array([
     [255, 0, 0, 255], # front
@@ -316,5 +317,129 @@ class NeRFDataset:
     def dataloader(self, batch_size=None):
         batch_size = batch_size or self.opt.batch_size
         loader = DataLoader(list(range(self.size)), batch_size=batch_size, collate_fn=self.collate, shuffle=self.training, num_workers=0)
+        loader._data = self
+        return loader
+
+class VideoDiffusionDataset:
+    def __init__(self, opt, device, type='train', H=256, W=256, size=100,num_frames=16):
+        super().__init__()
+
+        self.opt = opt
+        self.device = device
+        self.type = type # train, val, test
+
+        self.H = H
+        self.W = W
+        self.size = size
+
+        self.training = self.type in ['train', 'all']
+
+        self.cx = self.H / 2
+        self.cy = self.W / 2
+        self.num_frames = opt.num_frames
+        self.near = self.opt.min_near
+        self.far = 1000 # infinite
+        self.num_frames = num_frames
+        # [debug] visualize poses
+        # poses, dirs, _, _, _ = rand_poses(100, self.device, opt, radius_range=self.opt.radius_range, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, jitter=self.opt.jitter_pose, uniform_sphere_rate=1)
+        # visualize_poses(poses.detach().cpu().numpy(), dirs.detach().cpu().numpy())
+
+    def get_default_view_data(self):
+
+        H = int(self.opt.known_view_scale * self.H)
+        W = int(self.opt.known_view_scale * self.W)
+        cx = H / 2
+        cy = W / 2
+
+        radii = torch.FloatTensor(self.opt.ref_radii).to(self.device)
+        thetas = torch.FloatTensor(self.opt.ref_polars).to(self.device)
+        phis = torch.FloatTensor(self.opt.ref_azimuths).to(self.device)
+        poses, dirs = circle_poses(self.device, radius=radii, theta=thetas, phi=phis, return_dirs=True, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front)
+        fov = self.opt.default_fovy
+        focal = H / (2 * np.tan(np.deg2rad(fov) / 2))
+        intrinsics = np.array([focal, focal, cx, cy])
+
+        projection = torch.tensor([
+            [2*focal/W, 0, 0, 0],
+            [0, -2*focal/H, 0, 0],
+            [0, 0, -(self.far+self.near)/(self.far-self.near), -(2*self.far*self.near)/(self.far-self.near)],
+            [0, 0, -1, 0]
+        ], dtype=torch.float32, device=self.device).unsqueeze(0).repeat(len(radii), 1, 1)
+
+        mvp = projection @ torch.inverse(poses) # [B, 4, 4]
+
+        # sample a low-resolution but full image
+        rays = get_rays(poses, intrinsics, H, W, -1)
+
+        data = {
+            'H': H,
+            'W': W,
+            'rays_o': rays['rays_o'],
+            'rays_d': rays['rays_d'],
+            'dir': dirs,
+            'mvp': mvp,
+            'polar': self.opt.ref_polars,
+            'azimuth': self.opt.ref_azimuths,
+            'radius': self.opt.ref_radii,
+        }
+
+        return data
+
+    def collate(self, index):
+
+        B = len(index)
+        radius_range = self.opt.radius_range
+        rand_radius = np.random.random() * (radius_range[1] - radius_range[0]) + radius_range[0]
+
+        delta_r = torch.FloatTensor(1).uniform_((radius_range[0]-rand_radius)/self.num_frames,(radius_range[1]-rand_radius)/self.num_frames)
+        delta_theta = torch.FloatTensor(1).uniform_(-np.pi/(4*self.num_frames),np.pi/(4*self.num_frames))
+        delta_phis = torch.FloatTensor(1).uniform_(-np.pi/(4*self.num_frames),np.pi/(4*self.num_frames))
+        # thetas = []
+        phis = []
+        # radiuses = []
+        poses = []
+        dirs = []
+        for i in range(self.num_frames):
+            # circle pose
+            theta = torch.FloatTensor([self.opt.default_polar + (i-0)*delta_theta*180/np.pi]).to(self.device)#90
+            phi = torch.FloatTensor([self.opt.default_azimuth + i*delta_phis*180/np.pi]).to(self.device)#0
+            radius = torch.FloatTensor([rand_radius + i*delta_r]).to(self.device)
+            pose, dir = circle_poses(self.device, radius=radius, theta=theta, phi=phi, return_dirs=True, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front)
+            # thetas.append(theta)
+            phis.append(phi)
+            # radiuses.append(radius)
+            # fixed focal
+            fov = self.opt.default_fovy
+            poses.append(pose)
+            dirs.append(dir)
+        poses = torch.stack(poses, dim=0)
+        dirs  = torch.stack(dirs, dim=0)
+        focal = self.H / (2 * np.tan(np.deg2rad(fov) / 2))
+        intrinsics = np.array([focal, focal, self.cx, self.cy])
+
+
+        # sample a low-resolution but full image
+        rays = get_video_rays(poses, intrinsics, self.H, self.W, -1)
+        #timestamps [num_frames,B,N,1]
+        timestamps = torch.linspace(-1, 1, self.num_frames).to(self.device)
+        timestamps = timestamps[..., None,None,None].expand_as(rays['rays_o'])
+        timestamps = timestamps.narrow(3,0,1)
+        # delta polar/azimuth/radius to default view
+        # rays_o [num_frames, B, N, 3]
+        data = {
+            'H': self.H,
+            'W': self.W,
+            'rays_o': rays['rays_o'],
+            'rays_d': rays['rays_d'],
+            'dir': dirs,
+            'azimuth': phis,
+            'timestamps':timestamps,
+        }
+
+        return data
+
+    def dataloader(self, batch_size=None):
+        batch_size = batch_size or self.opt.batch_size
+        loader = DataLoader(list(range(self.size)), batch_size=batch_size, collate_fn=self.collate, shuffle=False, num_workers=0)
         loader._data = self
         return loader
